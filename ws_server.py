@@ -1,25 +1,36 @@
 """
-ws_server.py — Exotel Outbound + Realtime Voicebot (Minimal)
-------------------------------------------------------------
-This file lets you:
-- Trigger outbound calls to your Exotel Voicebot flow (Flow Runs v2)
-- Serve a /exotel-ws-bootstrap URL (Exotel reads the WS URL from here)
-- Handle the /exotel-media WebSocket (bidirectional audio with the callee)
-- Bridge Exotel <-> OpenAI Realtime with correct 24k→8k downsampling
+ws_server.py — Exotel Outbound + Realtime Voicebot + Status + CSV Campaigns
+---------------------------------------------------------------------------
+Features:
+- Trigger outbound calls to Exotel Voicebot Flow (Flow Runs v2)
+- Serve /exotel-ws-bootstrap for Exotel Voicebot (Bidirectional) applet
+- Handle /exotel-media WebSocket for realtime AI voicebot (OpenAI Realtime)
+- Receive Exotel call status webhooks at /exotel/status
+- Upload CSV of leads (/outbound/csv) to trigger outbound campaign
 
 ENV (set in Render):
   EXO_SID, EXO_API_KEY, EXO_API_TOKEN, EXO_FLOW_ID, EXO_SUBDOMAIN=api, EXO_CALLER_ID
-  OPENAI_API_KEY, OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
-  PUBLIC_BASE_URL=<your-render-hostname-without-https>  e.g. openai-exotel-elevenlabs-realtime.onrender.com
+  OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
+  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
+  PUBLIC_BASE_URL=<your-render-hostname-without-https> e.g. openai-exotel-elevenlabs-realtime.onrender.com
   LOG_LEVEL=INFO
+  SAVE_TTS_WAV=1 (optional, save OpenAI audio to /tmp)
 """
 
-import os, json, base64, asyncio, logging, time, wave, audioop
+import os, json, base64, asyncio, logging, time, wave, audioop, csv
 from typing import Optional, List
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
-from fastapi.responses import PlainTextResponse
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    Body,
+    UploadFile,
+    File,
+    Request,
+)
+from fastapi.responses import PlainTextResponse, JSONResponse
 from aiohttp import ClientSession, WSMsgType
 
 # ---------------- Logging ----------------
@@ -39,19 +50,24 @@ EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")
 EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
 
 # ---------------- OpenAI ENV ----------------
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY") or os.getenv("OpenAI_Key") or os.getenv("OPENAI_KEY", "")
-REALTIME_MODEL     = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+OPENAI_API_KEY = (
+    os.getenv("OPENAI_API_KEY")
+    or os.getenv("OpenAI_Key")
+    or os.getenv("OPENAI_KEY", "")
+)
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
 # ---------------- Misc ENV ----------------
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()   # no protocol
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol
 SAVE_TTS_WAV    = os.getenv("SAVE_TTS_WAV", "0") == "1"
 
-# ---------------- Helpers ----------------
+# ---------------- Helper: downsample ----------------
 def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
     """24 kHz mono PCM16 -> 8 kHz mono PCM16 using stdlib audioop."""
     converted, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
     return converted
 
+# ---------------- Helper: Exotel outbound Flow Run ----------------
 async def exotel_start_voicebot_call(to_e164: str, custom_params: dict | None = None) -> dict:
     """Start an Exotel Flow Run that begins with your Voicebot applet."""
     if not all([EXO_SID, EXO_API_KEY, EXO_API_TOKEN, EXO_FLOW_ID]):
@@ -76,26 +92,105 @@ async def exotel_start_voicebot_call(to_e164: str, custom_params: dict | None = 
 async def health():
     return "ok"
 
-# ---------------- Outbound REST ----------------
+# ---------------- Outbound REST (single) ----------------
 @app.post("/outbound/call")
-async def outbound_call(number: str = Body(..., embed=True), name: str | None = Body(None, embed=True)):
-    """Trigger one outbound call that lands the callee inside your Voicebot flow."""
+async def outbound_call(
+    number: str = Body(..., embed=True),
+    name: str | None = Body(None, embed=True),
+):
+    """
+    POST /outbound/call
+    Body: {"number": "9876543210", "name": "Raj"}
+    Triggers one outbound call; callee lands in your Voicebot Flow.
+    """
     to = number if number.startswith("+") else f"+91{number}"
     res = await exotel_start_voicebot_call(to, {"name": name or ""})
     return {"ok": True, "exotel": res}
 
+# ---------------- Outbound REST (batch) ----------------
 @app.post("/outbound/batch")
 async def outbound_batch(numbers: List[str]):
-    """Trigger a sequential batch (respect your channels)."""
-    out = []
+    """
+    POST /outbound/batch
+    Body: ["9876543210", "9820098200", ...]
+    Triggers sequential outbound calls to a list of numbers.
+    """
+    results = []
     for n in numbers:
         try:
             to = n if n.startswith("+") else f"+91{n}"
-            out.append(await exotel_start_voicebot_call(to))
+            res = await exotel_start_voicebot_call(to)
+            results.append({"number": n, "status": "ok", "exotel": res})
+            await asyncio.sleep(0.5)  # respect channel capacity & API
+        except Exception as e:
+            logger.exception("Error calling %s: %s", n, e)
+            results.append({"number": n, "status": "error", "error": str(e)})
+    return results
+
+# ---------------- Outbound CSV uploader ----------------
+@app.post("/outbound/csv")
+async def outbound_csv(file: UploadFile = File(...)):
+    """
+    POST /outbound/csv
+    Multipart form-data with a file field named 'file'.
+    CSV format: number,name
+      - 'number' column mandatory
+      - 'name' optional
+    Example:
+      9876543210,Raj
+      9820098200,Seema
+    """
+    content = await file.read()
+    text = content.decode("utf-8", errors="ignore")
+    reader = csv.DictReader(text.splitlines())
+    results = []
+
+    for row in reader:
+        number = (row.get("number") or "").strip()
+        name = (row.get("name") or "").strip()
+        if not number:
+            continue
+        try:
+            to = number if number.startswith("+") else f"+91{number}"
+            res = await exotel_start_voicebot_call(to, {"name": name})
+            results.append({"number": number, "name": name, "status": "ok", "exotel": res})
             await asyncio.sleep(0.5)
         except Exception as e:
-            out.append({"number": n, "error": str(e)})
-    return out
+            logger.exception("Error calling %s: %s", number, e)
+            results.append({"number": number, "name": name, "status": "error", "error": str(e)})
+    return {"count": len(results), "results": results}
+
+# ---------------- Exotel status webhook ----------------
+@app.post("/exotel/status")
+async def exotel_status(request: Request):
+    """
+    Exotel call status webhook.
+    Configure in Exotel dashboard to POST here.
+    Logs call lifecycle events (answered, completed, failed, etc.).
+    """
+    # Exotel usually sends application/x-www-form-urlencoded
+    try:
+        form = await request.form()
+        data = dict(form)
+    except Exception:
+        data = {}
+
+    # Common fields: CallSid, Status, Direction, From, To, StartTime, EndTime, etc.
+    call_sid = data.get("CallSid") or data.get("CallSid[]")
+    status   = data.get("Status") or data.get("Status[]")
+    frm      = data.get("From") or data.get("From[]")
+    to       = data.get("To") or data.get("To[]")
+    logger.info(
+        "Exotel status: CallSid=%s Status=%s From=%s To=%s Raw=%s",
+        call_sid,
+        status,
+        frm,
+        to,
+        data,
+    )
+
+    # You could persist this to DB here; for now just acknowledge
+    return JSONResponse({"ok": True})
 
 # ---------------- Bootstrap for Exotel Voicebot ----------------
 @app.get("/exotel-ws-bootstrap")
@@ -118,9 +213,9 @@ async def exotel_media_ws(ws: WebSocket):
     """
     Bidirectional audio bridge for Exotel Voicebot (callee leg @ 8 kHz PCM16).
     - Receives Exotel media events (8k PCM16 base64)
-    - Accumulates ~120ms windows and sends a response.create with *inline* input_audio to OpenAI
+    - Accumulates ~120ms windows and sends a response.create with inline input_audio to OpenAI
     - Streams OpenAI audio deltas back to Exotel, downsampled 24k -> 8k
-    - Supports barge-in by canceling and sending a new turn when the user speaks mid-reply
+    - Supports barge-in
     """
     await ws.accept()
     logger.info("Exotel WS connected")
@@ -130,17 +225,14 @@ async def exotel_media_ws(ws: WebSocket):
         await ws.close()
         return
 
-    # Exotel side constants
     EXO_SR = 8000
     BYTES_PER_SAMPLE = 2
     MIN_WINDOW = int(EXO_SR * BYTES_PER_SAMPLE * 0.12)  # ~120ms =~ 1920 bytes @ 8k
 
-    # State
     pending = False
     speaking = False
     connected_to_openai = False
 
-    # Turn accumulators
     live_chunks: List[str] = []
     live_bytes = 0
     live_frames = 0
@@ -149,7 +241,6 @@ async def exotel_media_ws(ws: WebSocket):
     barge_bytes = 0
     barge_frames = 0
 
-    # OpenAI session
     openai_session: Optional[ClientSession] = None
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
@@ -176,8 +267,8 @@ async def exotel_media_ws(ws: WebSocket):
         await send_openai({
             "type": "session.update",
             "session": {
-                "input_audio_format":  "pcm16",   # we send 8k PCM16 windows inline
-                "output_audio_format": "pcm16",   # easy to downsample 24k->8k
+                "input_audio_format":  "pcm16",
+                "output_audio_format": "pcm16",
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
@@ -198,11 +289,9 @@ async def exotel_media_ws(ws: WebSocket):
                         evt = msg.json()
                         et = evt.get("type")
 
-                        # Some builds emit "response.output_audio.delta"; others "response.audio.delta"
                         if et in ("response.output_audio.delta", "response.audio.delta"):
                             b64 = evt.get("delta")
                             if b64 and ws.client_state.name != "DISCONNECTED":
-                                # decode 24k PCM16, downsample to 8k for Exotel
                                 pcm24 = base64.b64decode(b64)
                                 if SAVE_TTS_WAV:
                                     tts_dump.extend(pcm24)
@@ -267,7 +356,7 @@ async def exotel_media_ws(ws: WebSocket):
             return
         await send_openai({
             "type": "response.create",
-            "input_audio": [{"audio": c, "format": "pcm16"} for c in chunks],  # top-level
+            "input_audio": [{"audio": c, "format": "pcm16"} for c in chunks],
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": "Reply in English only. Keep it short."
@@ -283,11 +372,9 @@ async def exotel_media_ws(ws: WebSocket):
             ev = m.get("event")
 
             if ev == "start":
-                # Exotel side is always 8k PCM16 on this leg
                 logger.info("Exotel stream started sr=8000")
 
             elif ev == "media":
-                # Exotel may send either {"audio": "..."} or {"media":{"payload":"..."}}
                 b64 = m.get("audio")
                 if not b64:
                     media = m.get("media") or {}
@@ -303,12 +390,10 @@ async def exotel_media_ws(ws: WebSocket):
                 if blen == 0:
                     continue
 
-                # lazy connect to OpenAI on first real frame
                 if not connected_to_openai:
                     await openai_connect()
 
                 if pending or speaking:
-                    # callee talking while bot is speaking (barge-in)
                     barge_chunks.append(b64)
                     barge_bytes += blen
                     barge_frames += 1
@@ -322,7 +407,6 @@ async def exotel_media_ws(ws: WebSocket):
                         barge_chunks.clear(); barge_bytes = barge_frames = 0
                     continue
 
-                # model idle — accumulate ~120ms then send a turn
                 live_chunks.append(b64)
                 live_bytes += blen
                 live_frames += 1
@@ -336,7 +420,6 @@ async def exotel_media_ws(ws: WebSocket):
                 break
 
             else:
-                # ignore others
                 pass
 
     except WebSocketDisconnect:

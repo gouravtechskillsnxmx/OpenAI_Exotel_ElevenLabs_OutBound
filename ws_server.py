@@ -11,7 +11,7 @@ Features:
   - View recent call logs
 
 ENV (set in Render):
-  EXO_SID           e.g. gouravnxmx_outbound
+  EXO_SID           e.g. gouravnxmx1
   EXO_API_KEY       from Exotel API settings
   EXO_API_TOKEN     from Exotel API settings
   EXO_FLOW_ID       e.g. 1077390 (your Voicebot app id)
@@ -60,8 +60,6 @@ app = FastAPI(title="Exotel Outbound Realtime LIC Agent")
 
 # ---------------- DB (SQLite) ----------------
 DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
-intro_sent = False  # has LIC agent greeted yet?
-
 
 
 def init_db():
@@ -96,7 +94,6 @@ def upsert_call_log(data: dict):
     """
     call_sid = data.get("CallSid") or data.get("CallSid[]") or ""
     if not call_sid:
-        # no sid: just ignore
         return
 
     direction = data.get("Direction") or data.get("Direction[]") or ""
@@ -116,7 +113,6 @@ def upsert_call_log(data: dict):
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Try upsert by call_sid
     c.execute(
         """
         INSERT INTO call_logs (
@@ -218,11 +214,10 @@ async def exotel_connect_voicebot(to_e164: str) -> dict:
     base = f"https://{EXO_SUBDOMAIN}.exotel.com"
     url = f"{base}/v1/Accounts/{EXO_SID}/Calls/connect.json"
 
-    # This App / Flow should contain the Voicebot applet pointing to /exotel-ws-bootstrap
     exoml_url = f"https://my.exotel.com/{EXO_SID}/exoml/start_voice/{EXO_FLOW_ID}"
 
     payload = {
-        "From": to_e164,          # customer number to call first
+        "From": to_e164,
         "CallerId": EXO_CALLER_ID,
         "Url": exoml_url,
         "CallType": "trans",
@@ -263,7 +258,6 @@ async def exotel_outbound_call(body: OutboundCallRequest):
     Start an outbound call to a customer and connect them to your
     realtime LIC insurance agent via the Exotel Voicebot App (EXO_FLOW_ID).
     """
-    # Normalize to E.164 (+91...) for India
     to = body.to_number
     if not to.startswith("+"):
         to = f"+91{to}"
@@ -286,7 +280,7 @@ async def outbound_batch(numbers: List[str]):
             to = n if n.startswith("+") else f"+91{n}"
             res = await exotel_connect_voicebot(to)
             results.append({"number": n, "status": "ok", "exotel": res})
-            await asyncio.sleep(0.5)  # respect channel capacity & API rate limits
+            await asyncio.sleep(0.5)
         except Exception as e:
             logger.exception("Error calling %s: %s", n, e)
             results.append({"number": n, "status": "error", "error": str(e)})
@@ -300,11 +294,6 @@ async def outbound_csv(file: UploadFile = File(...)):
     POST /outbound/csv
     Multipart form-data with a file field named 'file'.
     CSV format: number,name
-      - 'number' column mandatory
-      - 'name' optional
-    Example:
-      9876543210,Raj
-      9820098200,Seema
     """
     content = await file.read()
     text = content.decode("utf-8", errors="ignore")
@@ -318,7 +307,6 @@ async def outbound_csv(file: UploadFile = File(...)):
             continue
         try:
             to = number if number.startswith("+") else f"+91{number}"
-            # You can pass name via custom_params later if you want.
             res = await exotel_connect_voicebot(to)
             results.append({"number": number, "name": name, "status": "ok", "exotel": res})
             await asyncio.sleep(0.5)
@@ -334,9 +322,6 @@ async def exotel_status(request: Request):
     """
     Exotel call status webhook.
     Configure in Exotel Voicebot / App to POST here.
-
-    This will log call lifecycle events (ringing, answered, completed, failed, etc.)
-    and save into SQLite call_logs.
     """
     try:
         form = await request.form()
@@ -358,19 +343,13 @@ async def exotel_status(request: Request):
         data,
     )
 
-    # Save into DB
     upsert_call_log(data)
-
     return JSONResponse({"ok": True})
 
 
 # ---------------- API to fetch call logs ----------------
 @app.get("/calls")
 async def list_calls(limit: int = Query(50, ge=1, le=500)):
-    """
-    GET /calls?limit=50
-    Returns latest call logs from SQLite.
-    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -406,9 +385,6 @@ async def list_calls(limit: int = Query(50, ge=1, le=500)):
 # ---------------- Bootstrap for Exotel Voicebot ----------------
 @app.get("/exotel-ws-bootstrap")
 async def exotel_ws_bootstrap():
-    """
-    Exotel Voicebot applet hits this URL and expects: {"url": "wss://<host>/exotel-media"}.
-    """
     try:
         base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         url = f"wss://{base}/exotel-media"
@@ -424,11 +400,7 @@ async def exotel_ws_bootstrap():
 async def exotel_media_ws(ws: WebSocket):
     """
     Bidirectional audio bridge for Exotel Voicebot (callee leg @ 8 kHz PCM16).
-    - Receives Exotel media events (8k PCM16 base64)
-    - Sends inline input_audio turns to OpenAI Realtime (no buffer/commit)
-    - Streams OpenAI audio deltas back to Exotel, downsampled 24k -> 8k
-    - Supports barge-in
-    - LIC insurance agent persona
+    LIC insurance agent persona, bot greets first.
     """
     await ws.accept()
     logger.info("Exotel WS connected")
@@ -440,11 +412,12 @@ async def exotel_media_ws(ws: WebSocket):
 
     EXO_SR = 8000
     BYTES_PER_SAMPLE = 2
-    MIN_WINDOW = int(EXO_SR * BYTES_PER_SAMPLE * 0.12)  # ~120ms =~ 1920 bytes @ 8k
+    MIN_WINDOW = int(EXO_SR * BYTES_PER_SAMPLE * 0.12)  # ~120ms
 
     pending = False
     speaking = False
     connected_to_openai = False
+    intro_sent = False
 
     live_chunks: List[str] = []
     live_bytes = 0
@@ -467,10 +440,10 @@ async def exotel_media_ws(ws: WebSocket):
             logger.info("SENDING to OpenAI: %s", t)
         await openai_ws.send_json(payload)
 
-        async def openai_connect():
-            nonlocal openai_session, openai_ws, pump_task, connected_to_openai, pending, speaking
-            if connected_to_openai:
-                return
+    async def openai_connect():
+        nonlocal openai_session, openai_ws, pump_task, connected_to_openai, pending, speaking
+        if connected_to_openai:
+            return
 
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
@@ -575,7 +548,7 @@ async def exotel_media_ws(ws: WebSocket):
             pass
 
     async def send_turn_from_chunks(chunks: List[str]):
-        """Send one response.create turn with inline input_audio (no buffer/commit)."""
+        """Send one response.create turn with inline input_audio."""
         nonlocal pending
         if not chunks:
             return
@@ -602,11 +575,9 @@ async def exotel_media_ws(ws: WebSocket):
             if ev == "start":
                 logger.info("Exotel stream started sr=8000")
 
-                # Connect to OpenAI if not already
                 if not connected_to_openai:
                     await openai_connect()
 
-                # Only send greeting once
                 if not intro_sent:
                     await send_openai({
                         "type": "response.create",
@@ -628,7 +599,6 @@ async def exotel_media_ws(ws: WebSocket):
                     intro_sent = True
                     pending = True
 
-
             elif ev == "media":
                 b64 = m.get("audio")
                 if not b64:
@@ -648,7 +618,6 @@ async def exotel_media_ws(ws: WebSocket):
                 if not connected_to_openai:
                     await openai_connect()
 
-                # If a response is pending or actively speaking, buffer into barge window.
                 if pending or speaking:
                     barge_chunks.append(b64)
                     barge_bytes += blen
@@ -663,7 +632,6 @@ async def exotel_media_ws(ws: WebSocket):
                         barge_chunks.clear(); barge_bytes = barge_frames = 0
                     continue
 
-                # Normal listening window
                 live_chunks.append(b64)
                 live_bytes += blen
                 live_frames += 1
@@ -677,7 +645,6 @@ async def exotel_media_ws(ws: WebSocket):
                 break
 
             else:
-                # Unknown / ignored events
                 pass
 
     except WebSocketDisconnect:
@@ -695,11 +662,6 @@ async def exotel_media_ws(ws: WebSocket):
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    """
-    Minimal HTML dashboard:
-    - Upload CSV to /outbound/csv
-    - See recent call logs from /calls
-    """
     return """
 <!DOCTYPE html>
 <html>
@@ -819,7 +781,6 @@ async function loadCalls() {
   log("Loaded " + (data.calls || []).length + " calls");
 }
 
-// Auto-load calls on page open
 loadCalls();
 </script>
 </body>

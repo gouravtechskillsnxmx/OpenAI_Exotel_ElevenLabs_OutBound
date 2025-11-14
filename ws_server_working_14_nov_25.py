@@ -1,35 +1,23 @@
 """
-ws_server.py — Exotel Outbound Realtime LIC Agent + Call Logs + CSV Dashboard
------------------------------------------------------------------------------
-
+ws_server.py — Exotel Outbound Realtime Voicebot + OpenAI Realtime
+------------------------------------------------------------------
 Features:
-- Outbound calls via Exotel Connect API to a Voicebot App/Flow (EXO_FLOW_ID)
-- Realtime LIC insurance agent voicebot using OpenAI Realtime
-- Exotel status webhook saving call details into SQLite
-- Simple dashboard at /dashboard:
-  - Upload CSV (number,name) to trigger outbound calls
-  - View recent call logs
+- Trigger outbound calls to an Exotel Voicebot Flow (Connect API v1)
+- Serve /exotel-ws-bootstrap for Exotel Voicebot (Bidirectional) applet
+- Handle /exotel-media WebSocket for realtime AI voicebot (OpenAI Realtime)
+- Receive Exotel call status webhooks at /exotel/status
+- CSV / batch outbound helpers
 
 ENV (set in Render):
-  EXO_SID           e.g. gouravnxmx_outbound
-  EXO_API_KEY       from Exotel API settings
-  EXO_API_TOKEN     from Exotel API settings
-  EXO_FLOW_ID       e.g. 1077390 (your Voicebot app id)
-  EXO_SUBDOMAIN     api or api.in   (NOT the full domain)
-  EXO_CALLER_ID     your Exophone, e.g. 09513886363
-
+  EXO_SID, EXO_API_KEY, EXO_API_TOKEN, EXO_FLOW_ID, EXO_SUBDOMAIN=api, EXO_CALLER_ID
   OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
-  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview (optional)
-
-  PUBLIC_BASE_URL   e.g. openai-exotel-elevenlabs-outbound.onrender.com
+  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
+  PUBLIC_BASE_URL=<your-render-hostname-without-https> e.g. openai-exotel-elevenlabs-realtime.onrender.com
   LOG_LEVEL=INFO
-
-  DB_PATH=/tmp/call_logs.db   (or /data/call_logs.db if you have persistent disk)
-  SAVE_TTS_WAV=1              (optional: save bot audio WAVs in /tmp)
+  SAVE_TTS_WAV=1 (optional, save OpenAI audio to /tmp)
 """
 
-import os, json, base64, asyncio, logging, time, wave, audioop, csv, sqlite3
-from pathlib import Path
+import os, json, base64, asyncio, logging, time, wave, audioop, csv
 from typing import Optional, List
 
 import httpx
@@ -42,9 +30,8 @@ from fastapi import (
     File,
     Request,
     HTTPException,
-    Query,
 )
-from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from aiohttp import ClientSession, WSMsgType
 from pydantic import BaseModel
 
@@ -55,120 +42,20 @@ logging.basicConfig(level=getattr(logging, level, logging.INFO))
 logger = logging.getLogger("ws_server")
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="Exotel Outbound Realtime LIC Agent")
-
-
-# ---------------- DB (SQLite) ----------------
-DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
-
-
-def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS call_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            call_sid TEXT UNIQUE,
-            direction TEXT,
-            from_number TEXT,
-            to_number TEXT,
-            status TEXT,
-            recording_url TEXT,
-            started_at TEXT,
-            ended_at TEXT,
-            raw_payload TEXT
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-    logger.info("SQLite DB initialized at %s", DB_PATH)
-
-
-def upsert_call_log(data: dict):
-    """
-    Upsert (by CallSid) a record into call_logs.
-    Exotel may send multiple status callbacks; we keep the latest.
-    """
-    call_sid = data.get("CallSid") or data.get("CallSid[]") or ""
-    if not call_sid:
-        # no sid: just ignore
-        return
-
-    direction = data.get("Direction") or data.get("Direction[]") or ""
-    frm = data.get("From") or data.get("From[]") or ""
-    to = data.get("To") or data.get("To[]") or ""
-    status = data.get("Status") or data.get("Status[]") or ""
-    recording_url = (
-        data.get("RecordingUrl")
-        or data.get("RecordingUrl[]")
-        or data.get("RecordingURL")
-        or ""
-    )
-    started_at = data.get("StartTime") or data.get("StartTime[]") or ""
-    ended_at = data.get("EndTime") or data.get("EndTime[]") or ""
-
-    raw_payload = json.dumps(data, ensure_ascii=False)
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # Try upsert by call_sid
-    c.execute(
-        """
-        INSERT INTO call_logs (
-            call_sid, direction, from_number, to_number, status,
-            recording_url, started_at, ended_at, raw_payload
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(call_sid) DO UPDATE SET
-            direction=excluded.direction,
-            from_number=excluded.from_number,
-            to_number=excluded.to_number,
-            status=excluded.status,
-            recording_url=excluded.recording_url,
-            started_at=excluded.started_at,
-            ended_at=excluded.ended_at,
-            raw_payload=excluded.raw_payload
-        """,
-        (
-            call_sid,
-            direction,
-            frm,
-            to,
-            status,
-            recording_url,
-            started_at,
-            ended_at,
-            raw_payload,
-        ),
-    )
-    conn.commit()
-    conn.close()
-    logger.info(
-        "call_log upserted: sid=%s status=%s from=%s to=%s recording=%s",
-        call_sid,
-        status,
-        frm,
-        to,
-        recording_url,
-    )
-
-
-init_db()
+app = FastAPI(title="Exotel Outbound Realtime Voicebot")
 
 
 # ---------------- Request models ----------------
 class OutboundCallRequest(BaseModel):
     """Body for /exotel-outbound-call"""
-    to_number: str   # customer mobile/landline, e.g. "8850298070"
+    to_number: str   # customer mobile/landline, e.g. "09052161119"
 
 
 # ---------------- Exotel ENV ----------------
 EXO_SID       = os.getenv("EXO_SID", "")
 EXO_API_KEY   = os.getenv("EXO_API_KEY", "")
 EXO_API_TOKEN = os.getenv("EXO_API_TOKEN", "")
-EXO_FLOW_ID   = os.getenv("EXO_FLOW_ID", "")            # App / Flow app id (e.g. 1077390)
+EXO_FLOW_ID   = os.getenv("EXO_FLOW_ID", "")            # App / Flow app id (e.g. 1075544)
 EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")       # "api" or "api.in"
 EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")          # Your Exophone
 
@@ -197,7 +84,7 @@ def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
 async def exotel_connect_voicebot(to_e164: str) -> dict:
     """
     Start an outbound call via Exotel Connect API and drop the callee
-    into your Voicebot App/Flow (EXO_FLOW_ID) which points to /exotel-ws-bootstrap.
+    into your Voicebot Flow (EXO_FLOW_ID) which points to /exotel-ws-bootstrap.
     """
     missing = [
         name for name, value in [
@@ -213,6 +100,7 @@ async def exotel_connect_voicebot(to_e164: str) -> dict:
         logger.error(msg)
         raise HTTPException(status_code=500, detail=msg)
 
+    # Connect API endpoint
     base = f"https://{EXO_SUBDOMAIN}.exotel.com"
     url = f"{base}/v1/Accounts/{EXO_SID}/Calls/connect.json"
 
@@ -259,9 +147,15 @@ async def health():
 async def exotel_outbound_call(body: OutboundCallRequest):
     """
     Start an outbound call to a customer and connect them to your
-    realtime LIC insurance agent via the Exotel Voicebot App (EXO_FLOW_ID).
+    realtime OpenAI bot via the Exotel Flow / App (EXO_FLOW_ID).
+
+    Flow:
+    1) Exotel calls `body.to_number` from your EXO_CALLER_ID.
+    2) When the customer answers, Exotel enters the Voice app 1075544.
+    3) That app has a Voicebot node pointing to your /exotel-ws-bootstrap.
+    4) Exotel connects its websocket to /exotel-media, which talks to OpenAI.
     """
-    # Normalize to E.164 (+91...) for India
+    # Normalize to E.164 (+91...) if you want India default
     to = body.to_number
     if not to.startswith("+"):
         to = f"+91{to}"
@@ -316,7 +210,6 @@ async def outbound_csv(file: UploadFile = File(...)):
             continue
         try:
             to = number if number.startswith("+") else f"+91{number}"
-            # You can pass name via custom_params later if you want.
             res = await exotel_connect_voicebot(to)
             results.append({"number": number, "name": name, "status": "ok", "exotel": res})
             await asyncio.sleep(0.5)
@@ -331,22 +224,21 @@ async def outbound_csv(file: UploadFile = File(...)):
 async def exotel_status(request: Request):
     """
     Exotel call status webhook.
-    Configure in Exotel Voicebot / App to POST here.
-
-    This will log call lifecycle events (ringing, answered, completed, failed, etc.)
-    and save into SQLite call_logs.
+    Configure in Exotel dashboard to POST here.
+    Logs call lifecycle events (answered, completed, failed, etc.).
     """
+    # Exotel usually sends application/x-www-form-urlencoded
     try:
         form = await request.form()
         data = dict(form)
     except Exception:
         data = {}
 
+    # Common fields: CallSid, Status, Direction, From, To, StartTime, EndTime, etc.
     call_sid = data.get("CallSid") or data.get("CallSid[]")
     status   = data.get("Status") or data.get("Status[]")
     frm      = data.get("From") or data.get("From[]")
     to       = data.get("To") or data.get("To[]")
-
     logger.info(
         "Exotel status: CallSid=%s Status=%s From=%s To=%s Raw=%s",
         call_sid,
@@ -356,49 +248,8 @@ async def exotel_status(request: Request):
         data,
     )
 
-    # Save into DB
-    upsert_call_log(data)
-
+    # You could persist this to DB here; for now just acknowledge
     return JSONResponse({"ok": True})
-
-
-# ---------------- API to fetch call logs ----------------
-@app.get("/calls")
-async def list_calls(limit: int = Query(50, ge=1, le=500)):
-    """
-    GET /calls?limit=50
-    Returns latest call logs from SQLite.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT call_sid, direction, from_number, to_number, status,
-               recording_url, started_at, ended_at
-        FROM call_logs
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = c.fetchall()
-    conn.close()
-
-    result = []
-    for r in rows:
-        result.append(
-            {
-                "call_sid": r[0],
-                "direction": r[1],
-                "from_number": r[2],
-                "to_number": r[3],
-                "status": r[4],
-                "recording_url": r[5],
-                "started_at": r[6],
-                "ended_at": r[7],
-            }
-        )
-    return {"calls": result}
 
 
 # ---------------- Bootstrap for Exotel Voicebot ----------------
@@ -408,13 +259,13 @@ async def exotel_ws_bootstrap():
     Exotel Voicebot applet hits this URL and expects: {"url": "wss://<host>/exotel-media"}.
     """
     try:
-        base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
+        base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-realtime.onrender.com"
         url = f"wss://{base}/exotel-media"
         logger.info("Bootstrap served: %s", url)
         return {"url": url}
     except Exception as e:
         logger.exception("/exotel-ws-bootstrap error: %s", e)
-        return {"url": f"wss://{(PUBLIC_BASE_URL or 'openai-exotel-elevenlabs-outbound.onrender.com')}/exotel-media"}
+        return {"url": f"wss://{(PUBLIC_BASE_URL or 'openai-exotel-elevenlabs-realtime.onrender.com')}/exotel-media"}
 
 
 # ---------------- Realtime media bridge (Exotel <-> OpenAI) ----------------
@@ -426,7 +277,6 @@ async def exotel_media_ws(ws: WebSocket):
     - Sends inline input_audio turns to OpenAI Realtime (no buffer/commit)
     - Streams OpenAI audio deltas back to Exotel, downsampled 24k -> 8k
     - Supports barge-in
-    - LIC insurance agent persona
     """
     await ws.accept()
     logger.info("Exotel WS connected")
@@ -475,7 +325,6 @@ async def exotel_media_ws(ws: WebSocket):
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-        # LIC Agent persona
         await send_openai({
             "type": "session.update",
             "session": {
@@ -488,19 +337,7 @@ async def exotel_media_ws(ws: WebSocket):
                     "silence_duration_ms": 600
                 },
                 "voice": "verse",
-                "instructions": (
-                    "You are an experienced Indian insurance agent specializing in LIC-style "
-                    "life insurance policies (like term plans and endowment plans). "
-                    "Speak in clear, friendly Indian English. "
-                    "First, understand the customer's age, family responsibilities, income range, "
-                    "and whether they prefer pure protection or some savings element. "
-                    "Explain options at a high level without promising guaranteed returns or giving "
-                    "specific product names or regulatory/SEBI/IRDA advice. "
-                    "Do NOT recommend exact policy numbers or premium amounts. "
-                    "Always remind the customer to consult a licensed human insurance advisor "
-                    "or LIC branch before final decisions. "
-                    "Keep answers concise, conversational, and focused on life cover and financial safety."
-                )
+                "instructions": "You are a concise helpful voice agent. Reply in clear Indian English."
             }
         })
 
@@ -583,10 +420,7 @@ async def exotel_media_ws(ws: WebSocket):
             "input_audio": [{"audio": c, "format": "pcm16"} for c in chunks],
             "response": {
                 "modalities": ["text", "audio"],
-                "instructions": (
-                    "Continue the conversation as the LIC-style insurance agent described earlier. "
-                    "Ask focused questions about their needs, explain benefits simply, and stay brief."
-                )
+                "instructions": "Reply in English only. Keep it short."
             }
         })
         pending = True
@@ -662,141 +496,6 @@ async def exotel_media_ws(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
-
-
-# ---------------- Simple CSV + Logs Dashboard ----------------
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    """
-    Minimal HTML dashboard:
-    - Upload CSV to /outbound/csv
-    - See recent call logs from /calls
-    """
-    return """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>LIC Outbound Voicebot Dashboard</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    h1 { margin-bottom: 0; }
-    .box { border: 1px solid #ccc; padding: 15px; margin: 15px 0; border-radius: 6px; }
-    input, button { padding: 8px; margin: 4px 0; }
-    #log { white-space: pre-line; border: 1px solid #ddd; padding: 10px; height: 200px; overflow-y: scroll; }
-    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
-    th, td { border: 1px solid #ddd; padding: 6px; font-size: 13px; }
-    th { background: #f0f0f0; }
-  </style>
-</head>
-<body>
-  <h1>LIC Outbound Voicebot Dashboard</h1>
-  <p>Backend: Exotel Connect + OpenAI Realtime (LIC insurance agent persona)</p>
-
-  <div class="box">
-    <h2>Single Call Test</h2>
-    <input id="single-number" placeholder="Mobile number (10 digits)"><br>
-    <button onclick="singleCall()">Call Now</button>
-  </div>
-
-  <div class="box">
-    <h2>CSV Campaign</h2>
-    <p>Upload CSV with columns: <code>number,name</code></p>
-    <input type="file" id="csv-file">
-    <button onclick="uploadCSV()">Upload & Call</button>
-  </div>
-
-  <div class="box">
-    <h2>Recent Call Logs</h2>
-    <button onclick="loadCalls()">Refresh</button>
-    <table id="calls-table">
-      <thead>
-        <tr>
-          <th>CallSid</th>
-          <th>From</th>
-          <th>To</th>
-          <th>Status</th>
-          <th>Start</th>
-          <th>End</th>
-          <th>Recording</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
-  <div class="box">
-    <h2>Log</h2>
-    <div id="log"></div>
-  </div>
-
-<script>
-const BASE = window.location.origin;
-
-function log(msg) {
-  const el = document.getElementById("log");
-  el.innerText += msg + "\\n";
-  el.scrollTop = el.scrollHeight;
-}
-
-async function singleCall() {
-  const num = document.getElementById("single-number").value.trim();
-  if (!num) { alert("Enter a number"); return; }
-
-  const payload = { to_number: num };
-  log("Calling " + num + " ...");
-  const res = await fetch(BASE + "/exotel-outbound-call", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  log("Response: " + JSON.stringify(data));
-}
-
-async function uploadCSV() {
-  const fileInput = document.getElementById("csv-file");
-  if (!fileInput.files.length) { alert("Choose a CSV file first"); return; }
-  const formData = new FormData();
-  formData.append("file", fileInput.files[0]);
-
-  log("Uploading CSV and triggering calls ...");
-  const res = await fetch(BASE + "/outbound/csv", {
-    method: "POST",
-    body: formData
-  });
-  const data = await res.json();
-  log("CSV result: " + JSON.stringify(data));
-}
-
-async function loadCalls() {
-  const res = await fetch(BASE + "/calls?limit=100");
-  const data = await res.json();
-  const tbody = document.querySelector("#calls-table tbody");
-  tbody.innerHTML = "";
-  (data.calls || []).forEach(c => {
-    const tr = document.createElement("tr");
-    const recLink = c.recording_url
-      ? '<a href="' + c.recording_url + '" target="_blank">Play</a>'
-      : '';
-    tr.innerHTML =
-      "<td>" + (c.call_sid || "") + "</td>" +
-      "<td>" + (c.from_number || "") + "</td>" +
-      "<td>" + (c.to_number || "") + "</td>" +
-      "<td>" + (c.status || "") + "</td>" +
-      "<td>" + (c.started_at || "") + "</td>" +
-      "<td>" + (c.ended_at || "") + "</td>" +
-      "<td>" + recLink + "</td>";
-    tbody.appendChild(tr);
-  });
-  log("Loaded " + (data.calls || []).length + " calls");
-}
-
-// Auto-load calls on page open
-loadCalls();
-</script>
-</body>
-</html>
-    """
 
 
 # --------------- Run locally ---------------

@@ -60,6 +60,8 @@ app = FastAPI(title="Exotel Outbound Realtime LIC Agent")
 
 # ---------------- DB (SQLite) ----------------
 DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
+intro_sent = False  # has LIC agent greeted yet?
+
 
 
 def init_db():
@@ -465,10 +467,11 @@ async def exotel_media_ws(ws: WebSocket):
             logger.info("SENDING to OpenAI: %s", t)
         await openai_ws.send_json(payload)
 
-    async def openai_connect():
-        nonlocal openai_session, openai_ws, pump_task, connected_to_openai, pending, speaking
-        if connected_to_openai:
-            return
+        async def openai_connect():
+            nonlocal openai_session, openai_ws, pump_task, connected_to_openai, pending, speaking
+            if connected_to_openai:
+                return
+
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
@@ -489,17 +492,15 @@ async def exotel_media_ws(ws: WebSocket):
                 },
                 "voice": "verse",
                 "instructions": (
-                    "You are an experienced Indian insurance agent specializing in LIC-style "
-                    "life insurance policies (like term plans and endowment plans). "
+                    "You are an experienced Indian life insurance agent specializing in LIC-style "
+                    "life insurance policies (term plans, endowment plans, etc.). "
                     "Speak in clear, friendly Indian English. "
-                    "First, understand the customer's age, family responsibilities, income range, "
-                    "and whether they prefer pure protection or some savings element. "
-                    "Explain options at a high level without promising guaranteed returns or giving "
-                    "specific product names or regulatory/SEBI/IRDA advice. "
-                    "Do NOT recommend exact policy numbers or premium amounts. "
-                    "Always remind the customer to consult a licensed human insurance advisor "
-                    "or LIC branch before final decisions. "
-                    "Keep answers concise, conversational, and focused on life cover and financial safety."
+                    "Your job on this call is to understand the customer's age, family responsibilities, "
+                    "income range, and whether they prefer pure protection or some savings element. "
+                    "Explain options at a high level without promising guaranteed returns, "
+                    "without quoting exact premiums or specific policy numbers. "
+                    "Always remind that final decisions must be taken with a licensed human insurance advisor "
+                    "or at an LIC branch. Keep answers concise and conversational."
                 )
             }
         })
@@ -601,27 +602,31 @@ async def exotel_media_ws(ws: WebSocket):
             if ev == "start":
                 logger.info("Exotel stream started sr=8000")
 
-                # Ensure OpenAI realtime is connected
+                # Connect to OpenAI if not already
                 if not connected_to_openai:
                     await openai_connect()
 
-                # Make the LIC agent speak first (no user audio needed)
-                await send_openai({
-                    "type": "response.create",
-                    "response": {
-                        "modalities": ["audio", "text"],
-                        "instructions": (
-                            "Start the conversation as an LIC-style life insurance agent. "
-                            "Greet the customer politely, introduce yourself as a life insurance advisor, "
-                            "and briefly explain that you help people choose suitable LIC-type policies "
-                            "for family protection and future goals. "
-                            "Then ask 1–2 simple questions about their age, family responsibilities, "
-                            "and whether they already have any life insurance. "
-                            "Keep it short and friendly."
-                        )
-                    }
-                })
-                pending = True
+                # Only send greeting once
+                if not intro_sent:
+                    await send_openai({
+                        "type": "response.create",
+                        "response": {
+                            "modalities": ["audio", "text"],
+                            "instructions": (
+                                "Start the call as a polite LIC-style life insurance agent. "
+                                "Greet the customer by saying something like "
+                                "'Namaste, I am your life insurance advisor calling from an LIC-style "
+                                "insurance service.' "
+                                "Briefly explain that you help people choose suitable life insurance "
+                                "plans for family protection and future goals. "
+                                "Then ask 1–2 simple questions: their age range, whether they have dependents, "
+                                "and if they already have any life insurance. "
+                                "Keep it short and friendly."
+                            )
+                        }
+                    })
+                    intro_sent = True
+                    pending = True
 
 
             elif ev == "media":

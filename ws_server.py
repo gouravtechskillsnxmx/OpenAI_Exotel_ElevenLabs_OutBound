@@ -548,21 +548,38 @@ async def exotel_media_ws(ws: WebSocket):
             pass
 
     async def send_turn_from_chunks(chunks: List[str]):
-        """Send one response.create turn with inline input_audio."""
+        """
+        Append audio chunks to OpenAI's input_audio_buffer, commit, then
+        request a LIC-style response.
+        """
         nonlocal pending
         if not chunks:
             return
+
+        # 1) Append each chunk to the server-side input_audio_buffer
+        for c in chunks:
+            await send_openai({
+                "type": "input_audio_buffer.append",
+                "audio": c,
+            })
+
+        # 2) Commit the buffer (now it has audio, so no "buffer too small" error)
+        await send_openai({
+            "type": "input_audio_buffer.commit",
+        })
+
+        # 3) Ask the model to respond (no input_audio parameter here)
         await send_openai({
             "type": "response.create",
-            "input_audio": [{"audio": c, "format": "pcm16"} for c in chunks],
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "Continue the conversation as the LIC-style insurance agent described earlier. "
-                    "Ask focused questions about their needs, explain benefits simply, and stay brief."
-                )
-            }
+                    "Continue the conversation as the LIC-style life insurance agent described earlier. "
+                    "Ask focused questions about their needs, explain benefits simply, and keep responses concise."
+                ),
+            },
         })
+
         pending = True
         logger.info("turn sent: chunks=%d", len(chunks))
 

@@ -601,6 +601,29 @@ async def exotel_media_ws(ws: WebSocket):
             if ev == "start":
                 logger.info("Exotel stream started sr=8000")
 
+                # Ensure OpenAI realtime is connected
+                if not connected_to_openai:
+                    await openai_connect()
+
+                # Make the LIC agent speak first (no user audio needed)
+                await send_openai({
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["audio", "text"],
+                        "instructions": (
+                            "Start the conversation as an LIC-style life insurance agent. "
+                            "Greet the customer politely, introduce yourself as a life insurance advisor, "
+                            "and briefly explain that you help people choose suitable LIC-type policies "
+                            "for family protection and future goals. "
+                            "Then ask 1–2 simple questions about their age, family responsibilities, "
+                            "and whether they already have any life insurance. "
+                            "Keep it short and friendly."
+                        )
+                    }
+                })
+                pending = True
+
+
             elif ev == "media":
                 b64 = m.get("audio")
                 if not b64:

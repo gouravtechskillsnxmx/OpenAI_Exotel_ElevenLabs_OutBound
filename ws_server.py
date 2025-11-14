@@ -1,12 +1,12 @@
 """
-ws_server.py — Exotel Outbound + Realtime Voicebot + Status + CSV Campaigns
----------------------------------------------------------------------------
+ws_server.py — Exotel Outbound Realtime Voicebot + OpenAI Realtime
+------------------------------------------------------------------
 Features:
-- Trigger outbound calls to Exotel Voicebot Flow (Flow Runs v2)
+- Trigger outbound calls to an Exotel Voicebot Flow (Connect API v1)
 - Serve /exotel-ws-bootstrap for Exotel Voicebot (Bidirectional) applet
 - Handle /exotel-media WebSocket for realtime AI voicebot (OpenAI Realtime)
 - Receive Exotel call status webhooks at /exotel/status
-- Upload CSV of leads (/outbound/csv) to trigger outbound campaign
+- CSV / batch outbound helpers
 
 ENV (set in Render):
   EXO_SID, EXO_API_KEY, EXO_API_TOKEN, EXO_FLOW_ID, EXO_SUBDOMAIN=api, EXO_CALLER_ID
@@ -29,9 +29,12 @@ from fastapi import (
     UploadFile,
     File,
     Request,
+    HTTPException,
 )
 from fastapi.responses import PlainTextResponse, JSONResponse
 from aiohttp import ClientSession, WSMsgType
+from pydantic import BaseModel
+
 
 # ---------------- Logging ----------------
 level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -39,15 +42,23 @@ logging.basicConfig(level=getattr(logging, level, logging.INFO))
 logger = logging.getLogger("ws_server")
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="Exotel Outbound + Realtime Voicebot")
+app = FastAPI(title="Exotel Outbound Realtime Voicebot")
+
+
+# ---------------- Request models ----------------
+class OutboundCallRequest(BaseModel):
+    """Body for /exotel-outbound-call"""
+    to_number: str   # customer mobile/landline, e.g. "09052161119"
+
 
 # ---------------- Exotel ENV ----------------
 EXO_SID       = os.getenv("EXO_SID", "")
 EXO_API_KEY   = os.getenv("EXO_API_KEY", "")
 EXO_API_TOKEN = os.getenv("EXO_API_TOKEN", "")
-EXO_FLOW_ID   = os.getenv("EXO_FLOW_ID", "")
-EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")
-EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
+EXO_FLOW_ID   = os.getenv("EXO_FLOW_ID", "")            # App / Flow app id (e.g. 1075544)
+EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")       # "api" or "api.in"
+EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")          # Your Exophone
+
 
 # ---------------- OpenAI ENV ----------------
 OPENAI_API_KEY = (
@@ -61,51 +72,97 @@ REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol
 SAVE_TTS_WAV    = os.getenv("SAVE_TTS_WAV", "0") == "1"
 
+
 # ---------------- Helper: downsample ----------------
 def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
     """24 kHz mono PCM16 -> 8 kHz mono PCM16 using stdlib audioop."""
     converted, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
     return converted
 
-# ---------------- Helper: Exotel outbound Flow Run ----------------
-async def exotel_start_voicebot_call(to_e164: str, custom_params: dict | None = None) -> dict:
-    """Start an Exotel Flow Run that begins with your Voicebot applet."""
-    if not all([EXO_SID, EXO_API_KEY, EXO_API_TOKEN, EXO_FLOW_ID]):
-        raise RuntimeError("Missing Exotel env: EXO_SID, EXO_API_KEY, EXO_API_TOKEN, EXO_FLOW_ID")
 
-    url = f"https://{EXO_SUBDOMAIN}.exotel.com/v2/accounts/{EXO_SID}/flows/{EXO_FLOW_ID}/runs"
-    payload = {"to": to_e164, "custom_params": custom_params or {}}
-    if EXO_CALLER_ID:
-        payload["caller_id"] = EXO_CALLER_ID
+# ---------------- Helper: Exotel outbound (Connect API) ----------------
+async def exotel_connect_voicebot(to_e164: str) -> dict:
+    """
+    Start an outbound call via Exotel Connect API and drop the callee
+    into your Voicebot Flow (EXO_FLOW_ID) which points to /exotel-ws-bootstrap.
+    """
+    missing = [
+        name for name, value in [
+            ("EXO_SID", EXO_SID),
+            ("EXO_API_KEY", EXO_API_KEY),
+            ("EXO_API_TOKEN", EXO_API_TOKEN),
+            ("EXO_FLOW_ID", EXO_FLOW_ID),
+            ("EXO_CALLER_ID", EXO_CALLER_ID),
+        ] if not value
+    ]
+    if missing:
+        msg = f"Missing Exotel env vars: {', '.join(missing)}"
+        logger.error(msg)
+        raise HTTPException(status_code=500, detail=msg)
 
-    logger.info("Exotel outbound -> %s", to_e164)
-    auth = (EXO_API_KEY, EXO_API_TOKEN)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, json=payload, auth=auth)
-        if r.status_code >= 400:
-            logger.error("Exotel API %s: %s", r.status_code, r.text)
-        r.raise_for_status()
-        return r.json()
+    # Connect API endpoint
+    base = f"https://{EXO_SUBDOMAIN}.exotel.com"
+    url = f"{base}/v1/Accounts/{EXO_SID}/Calls/connect.json"
+
+    # This App / Flow should contain the Voicebot applet pointing to /exotel-ws-bootstrap
+    exoml_url = f"https://my.exotel.com/{EXO_SID}/exoml/start_voice/{EXO_FLOW_ID}"
+
+    payload = {
+        "From": to_e164,          # customer number to call first
+        "CallerId": EXO_CALLER_ID,
+        "Url": exoml_url,
+        "CallType": "trans",
+    }
+
+    logger.info("Exotel Connect: %s -> %s (Url=%s)", EXO_CALLER_ID, to_e164, exoml_url)
+
+    async with httpx.AsyncClient(timeout=20.0, auth=(EXO_API_KEY, EXO_API_TOKEN)) as client:
+        resp = await client.post(url, data=payload)
+        text = resp.text
+
+    if resp.status_code >= 400:
+        logger.error("Exotel outbound error %s: %s", resp.status_code, text)
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Exotel error ({resp.status_code}): {text}",
+        )
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": text}
+
+    logger.info("Exotel outbound accepted: %s", data)
+    return data
+
 
 # ---------------- Health ----------------
 @app.get("/health", response_class=PlainTextResponse)
 async def health():
     return "ok"
 
+
 # ---------------- Outbound REST (single) ----------------
-@app.post("/outbound/call")
-async def outbound_call(
-    number: str = Body(..., embed=True),
-    name: str | None = Body(None, embed=True),
-):
+@app.post("/exotel-outbound-call")
+async def exotel_outbound_call(body: OutboundCallRequest):
     """
-    POST /outbound/call
-    Body: {"number": "9876543210", "name": "Raj"}
-    Triggers one outbound call; callee lands in your Voicebot Flow.
+    Start an outbound call to a customer and connect them to your
+    realtime OpenAI bot via the Exotel Flow / App (EXO_FLOW_ID).
+
+    Flow:
+    1) Exotel calls `body.to_number` from your EXO_CALLER_ID.
+    2) When the customer answers, Exotel enters the Voice app 1075544.
+    3) That app has a Voicebot node pointing to your /exotel-ws-bootstrap.
+    4) Exotel connects its websocket to /exotel-media, which talks to OpenAI.
     """
-    to = number if number.startswith("+") else f"+91{number}"
-    res = await exotel_start_voicebot_call(to, {"name": name or ""})
-    return {"ok": True, "exotel": res}
+    # Normalize to E.164 (+91...) if you want India default
+    to = body.to_number
+    if not to.startswith("+"):
+        to = f"+91{to}"
+
+    res = await exotel_connect_voicebot(to)
+    return {"status": "ok", "exotel": res}
+
 
 # ---------------- Outbound REST (batch) ----------------
 @app.post("/outbound/batch")
@@ -113,19 +170,20 @@ async def outbound_batch(numbers: List[str]):
     """
     POST /outbound/batch
     Body: ["9876543210", "9820098200", ...]
-    Triggers sequential outbound calls to a list of numbers.
+    Triggers sequential outbound realtime calls to a list of numbers.
     """
     results = []
     for n in numbers:
         try:
             to = n if n.startswith("+") else f"+91{n}"
-            res = await exotel_start_voicebot_call(to)
+            res = await exotel_connect_voicebot(to)
             results.append({"number": n, "status": "ok", "exotel": res})
-            await asyncio.sleep(0.5)  # respect channel capacity & API
+            await asyncio.sleep(0.5)  # respect channel capacity & API rate limits
         except Exception as e:
             logger.exception("Error calling %s: %s", n, e)
             results.append({"number": n, "status": "error", "error": str(e)})
     return results
+
 
 # ---------------- Outbound CSV uploader ----------------
 @app.post("/outbound/csv")
@@ -152,13 +210,14 @@ async def outbound_csv(file: UploadFile = File(...)):
             continue
         try:
             to = number if number.startswith("+") else f"+91{number}"
-            res = await exotel_start_voicebot_call(to, {"name": name})
+            res = await exotel_connect_voicebot(to)
             results.append({"number": number, "name": name, "status": "ok", "exotel": res})
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.exception("Error calling %s: %s", number, e)
             results.append({"number": number, "name": name, "status": "error", "error": str(e)})
     return {"count": len(results), "results": results}
+
 
 # ---------------- Exotel status webhook ----------------
 @app.post("/exotel/status")
@@ -192,11 +251,12 @@ async def exotel_status(request: Request):
     # You could persist this to DB here; for now just acknowledge
     return JSONResponse({"ok": True})
 
+
 # ---------------- Bootstrap for Exotel Voicebot ----------------
 @app.get("/exotel-ws-bootstrap")
 async def exotel_ws_bootstrap():
     """
-    Exotel calls this first and expects: {"url": "wss://<host>/exotel-media"}.
+    Exotel Voicebot applet hits this URL and expects: {"url": "wss://<host>/exotel-media"}.
     """
     try:
         base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-realtime.onrender.com"
@@ -207,13 +267,14 @@ async def exotel_ws_bootstrap():
         logger.exception("/exotel-ws-bootstrap error: %s", e)
         return {"url": f"wss://{(PUBLIC_BASE_URL or 'openai-exotel-elevenlabs-realtime.onrender.com')}/exotel-media"}
 
+
 # ---------------- Realtime media bridge (Exotel <-> OpenAI) ----------------
 @app.websocket("/exotel-media")
 async def exotel_media_ws(ws: WebSocket):
     """
     Bidirectional audio bridge for Exotel Voicebot (callee leg @ 8 kHz PCM16).
     - Receives Exotel media events (8k PCM16 base64)
-    - Accumulates ~120ms windows and sends a response.create with inline input_audio to OpenAI
+    - Sends inline input_audio turns to OpenAI Realtime (no buffer/commit)
     - Streams OpenAI audio deltas back to Exotel, downsampled 24k -> 8k
     - Supports barge-in
     """
@@ -393,6 +454,7 @@ async def exotel_media_ws(ws: WebSocket):
                 if not connected_to_openai:
                     await openai_connect()
 
+                # If a response is pending or actively speaking, buffer into barge window.
                 if pending or speaking:
                     barge_chunks.append(b64)
                     barge_bytes += blen
@@ -407,6 +469,7 @@ async def exotel_media_ws(ws: WebSocket):
                         barge_chunks.clear(); barge_bytes = barge_frames = 0
                     continue
 
+                # Normal listening window
                 live_chunks.append(b64)
                 live_bytes += blen
                 live_frames += 1
@@ -420,6 +483,7 @@ async def exotel_media_ws(ws: WebSocket):
                 break
 
             else:
+                # Unknown / ignored events
                 pass
 
     except WebSocketDisconnect:
@@ -433,7 +497,14 @@ async def exotel_media_ws(ws: WebSocket):
         except Exception:
             pass
 
+
 # --------------- Run locally ---------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("ws_server:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)), reload=False, workers=1)
+    uvicorn.run(
+        "ws_server:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        reload=False,
+        workers=1,
+    )

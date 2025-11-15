@@ -433,17 +433,13 @@ async def exotel_media_ws(ws: WebSocket):
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
+        # Start with VAD disabled to force intro
         await send_openai({
             "type": "session.update",
             "session": {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 0,
-                    "silence_duration_ms": 500
-                },
+                "turn_detection": None,  # Disable for intro
                 "voice": "verse",
                 "instructions": (
                     "You are a helpful LIC insurance agent. Speak in clear Indian English. "
@@ -453,7 +449,7 @@ async def exotel_media_ws(ws: WebSocket):
         })
 
         async def pump():
-            nonlocal speaking, pending
+            nonlocal speaking, pending, intro_sent
             tts = bytearray()
             try:
                 async for msg in openai_ws:
@@ -479,6 +475,20 @@ async def exotel_media_ws(ws: WebSocket):
                         speaking = False
                         pending = False
                         logger.info("Bot finished speaking")
+                        if not intro_sent:
+                            intro_sent = True
+                            logger.info("Intro done → enabling server VAD")
+                            await send_openai({
+                                "type": "session.update",
+                                "session": {
+                                    "turn_detection": {
+                                        "type": "server_vad",
+                                        "threshold": 0.4,  # Lower for sensitivity
+                                        "prefix_padding_ms": 600,  # More context
+                                        "silence_duration_ms": 400  # Quicker trigger
+                                    }
+                                }
+                            })
 
                     elif et == "error":
                         logger.error("OpenAI error: %s", evt)
@@ -521,14 +531,13 @@ async def exotel_media_ws(ws: WebSocket):
                     await send_openai({
                         "type": "response.create",
                         "response": {
-                            "modalities": ["text","audio"],
+                            "modalities": ["text", "audio"],
                             "instructions": (
                                 "Namaste! I am your LIC insurance advisor. "
                                 "May I know your age and if you have any family members?"
                             )
                         }
                     })
-                    intro_sent = True
                     pending = True
 
             elif ev == "media":
@@ -536,7 +545,8 @@ async def exotel_media_ws(ws: WebSocket):
                 if not b64:
                     continue
                 try:
-                    if len(base64.b64decode(b64)) == 0:
+                    audio_bytes = base64.b64decode(b64)
+                    if len(audio_bytes) == 0:
                         continue
                 except:
                     continue
@@ -544,13 +554,21 @@ async def exotel_media_ws(ws: WebSocket):
                 if not connected_to_openai:
                     await openai_connect()
 
-                # JUST APPEND — NO COMMIT, NO CREATE
+                # Resample input: 8kHz → 24kHz
+                samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                target_num = int(len(samples) * (24000 / 8000))
+                if target_num == 0:
+                    continue
+                resampled = resample(samples, target_num)
+                resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+                resampled_b64 = base64.b64encode(resampled.tobytes()).decode('utf-8')
+
                 await send_openai({
                     "type": "input_audio_buffer.append",
-                    "audio": b64
+                    "audio": resampled_b64
                 })
 
-                # Barge-in: cancel only if a response is pending/active
+                # Barge-in: cancel only if response is active
                 if pending:
                     await send_openai({"type": "response.cancel"})
                     pending = False
@@ -565,8 +583,7 @@ async def exotel_media_ws(ws: WebSocket):
     except Exception as e:
         logger.exception("Error: %s", e)
     finally:
-        await openai_close()
-        
+        await openai_close()        
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():

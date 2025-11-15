@@ -550,12 +550,12 @@ async def exotel_media_ws(ws: WebSocket):
                     "audio": b64
                 })
 
-                # Barge-in: cancel if user speaks while bot is talking
-                if speaking:
+                # Barge-in: cancel only if a response is pending/active
+                if pending:
                     await send_openai({"type": "response.cancel"})
-                    speaking = False
                     pending = False
-                    logger.info("Barge-in: cancelled bot")
+                    speaking = False
+                    logger.info("Barge-in: cancelled active response")
 
             elif ev == "stop":
                 break
@@ -566,7 +566,7 @@ async def exotel_media_ws(ws: WebSocket):
         logger.exception("Error: %s", e)
     finally:
         await openai_close()
-
+        
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():

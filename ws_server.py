@@ -47,6 +47,8 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from aiohttp import ClientSession, WSMsgType
 from pydantic import BaseModel
+import numpy as np
+from scipy.signal import resample
 
 
 # ---------------- Logging ----------------

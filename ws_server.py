@@ -419,15 +419,16 @@ async def exotel_media_ws(ws: WebSocket):
         logger.info(f"→ OpenAI: {t}")
         await openai_ws.send_json(payload)
 
-    async def connect():
+    async def connect_and_speak():
         nonlocal openai_session, openai_ws, pump_task
+
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-        # NO VAD, NO INPUT — just speak
+        # Disable VAD, force speech
         await send_openai({
             "type": "session.update",
             "session": {
@@ -435,11 +436,11 @@ async def exotel_media_ws(ws: WebSocket):
                 "output_audio_format": "pcm16",
                 "turn_detection": None,
                 "voice": "verse",
-                "instructions": "You are a test bot. Say only: Hello, how are you?"
+                "instructions": "Say only: Hello, how are you?"
             }
         })
 
-        # Force speech
+        # Trigger speech
         await send_openai({
             "type": "response.create",
             "response": {
@@ -461,7 +462,7 @@ async def exotel_media_ws(ws: WebSocket):
                         b64 = evt.get("delta")
                         if b64:
                             pcm24 = base64.b64decode(b64)
-                            pcm8 = pcm24 #downsample_24k_to_8k_pcm16(pcm24)
+                            pcm8 = downsample_24k_to_8k_pcm16(pcm24)
                             await ws.send_text(json.dumps({
                                 "event": "media",
                                 "audio": base64.b64encode(pcm8).decode()
@@ -478,17 +479,16 @@ async def exotel_media_ws(ws: WebSocket):
         pump_task = asyncio.create_task(pump())
 
     try:
-        # Wait for "start" from Exotel
+        # Wait for Exotel "start" event
         raw = await ws.receive_text()
         m = json.loads(raw)
         if m.get("event") == "start":
-            logger.info("Exotel stream started — connecting to OpenAI")
-            await connect()
+            logger.info("Exotel stream started — speaking now")
+            await connect_and_speak()
 
         # Ignore all other messages
-
-        async for _ in ws:
-            pass
+        while True:
+            await ws.receive_text()  # Keep connection alive
 
     except WebSocketDisconnect:
         logger.info("Call ended")

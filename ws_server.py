@@ -401,191 +401,106 @@ async def exotel_ws_bootstrap():
 @app.websocket("/exotel-media")
 async def exotel_media_ws(ws: WebSocket):
     await ws.accept()
-    logger.info("Exotel WS connected")
+    logger.info("TEST MODE: Bot will say 'Hello, how are you?' and hang up")
 
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY")
         await ws.close()
         return
 
-    openai_session: Optional[ClientSession] = None
+    openai_session = None
     openai_ws = None
-    pump_task: Optional[asyncio.Task] = None
-    connected_to_openai = False
-    intro_sent = False
-    speaking = False
-    pending = False
+    pump_task = None
 
     async def send_openai(payload: dict):
         if not openai_ws or openai_ws.closed:
             return
         t = payload.get("type")
-        if t != "response.audio.delta":
-            logger.info("→ OpenAI: %s", t)
+        logger.info(f"→ OpenAI: {t}")
         await openai_ws.send_json(payload)
 
-    async def openai_connect():
-        nonlocal openai_session, openai_ws, pump_task, connected_to_openai
-        if connected_to_openai:
-            return
-
+    async def connect():
+        nonlocal openai_session, openai_ws, pump_task
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-        # Start with VAD disabled to force intro
+        # NO VAD, NO INPUT — just speak
         await send_openai({
             "type": "session.update",
             "session": {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": None,  # Disable for intro
+                "turn_detection": None,
                 "voice": "verse",
-                "instructions": (
-                    "You are a helpful LIC insurance agent. Speak in clear Indian English. "
-                    "Ask about age, family, income, and insurance needs. Keep it short."
-                )
+                "instructions": "You are a test bot. Say only: Hello, how are you?"
+            }
+        })
+
+        # Force speech
+        await send_openai({
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions": "Say exactly: Hello, how are you?"
             }
         })
 
         async def pump():
-            nonlocal speaking, pending, intro_sent
-            tts = bytearray()
             try:
                 async for msg in openai_ws:
                     if msg.type != WSMsgType.TEXT:
                         continue
                     evt = msg.json()
                     et = evt.get("type")
+                    logger.info(f"OpenAI EVENT: {et}")
 
                     if et in ("response.audio.delta", "response.output_audio.delta"):
                         b64 = evt.get("delta")
                         if b64:
                             pcm24 = base64.b64decode(b64)
-                            if SAVE_TTS_WAV:
-                                tts.extend(pcm24)
                             pcm8 = downsample_24k_to_8k_pcm16(pcm24)
                             await ws.send_text(json.dumps({
                                 "event": "media",
                                 "audio": base64.b64encode(pcm8).decode()
                             }))
-                            speaking = True
 
                     elif et == "response.audio.done":
-                        speaking = False
-                        pending = False
-                        logger.info("Bot finished speaking")
-                        if not intro_sent:
-                            intro_sent = True
-                            logger.info("Intro done → enabling server VAD")
-                            await send_openai({
-                                "type": "session.update",
-                                "session": {
-                                    "turn_detection": {
-                                        "type": "server_vad",
-                                        "threshold": 0.4,  # Lower for sensitivity
-                                        "prefix_padding_ms": 600,  # More context
-                                        "silence_duration_ms": 400  # Quicker trigger
-                                    }
-                                }
-                            })
-
-                    elif et == "error":
-                        logger.error("OpenAI error: %s", evt)
-                        pending = False
+                        logger.info("Bot said: Hello, how are you?")
+                        await asyncio.sleep(1)
+                        await ws.close()  # End call
 
             except Exception as e:
                 logger.exception("Pump error: %s", e)
-            finally:
-                if SAVE_TTS_WAV and tts:
-                    fname = f"/tmp/tts_{int(time.time())}.wav"
-                    with wave.open(fname, "wb") as f:
-                        f.setnchannels(1)
-                        f.setsampwidth(2)
-                        f.setframerate(24000)
-                        f.writeframes(bytes(tts))
-                    logger.info("Saved TTS: %s", fname)
 
         pump_task = asyncio.create_task(pump())
-        connected_to_openai = True
 
-    async def openai_close():
+    try:
+        # Wait for "start" from Exotel
+        raw = await ws.receive_text()
+        m = json.loads(raw)
+        if m.get("event") == "start":
+            logger.info("Exotel stream started — connecting to OpenAI")
+            await connect()
+
+        # Ignore all other messages
+
+        async for _ in ws:
+            pass
+
+    except WebSocketDisconnect:
+        logger.info("Call ended")
+    except Exception as e:
+        logger.exception("Error: %s", e)
+    finally:
         if pump_task:
             pump_task.cancel()
         if openai_ws and not openai_ws.closed:
             await openai_ws.close()
         if openai_session:
             await openai_session.close()
-
-    try:
-        while True:
-            raw = await ws.receive_text()
-            m = json.loads(raw)
-            ev = m.get("event")
-
-            if ev == "start":
-                if not connected_to_openai:
-                    await openai_connect()
-
-                if not intro_sent:
-                    await send_openai({
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["text", "audio"],
-                            "instructions": (
-                                "Namaste! I am your LIC insurance advisor. "
-                                "May I know your age and if you have any family members?"
-                            )
-                        }
-                    })
-                    pending = True
-
-            elif ev == "media":
-                b64 = m.get("audio") or (m.get("media") or {}).get("payload")
-                if not b64:
-                    continue
-                try:
-                    audio_bytes = base64.b64decode(b64)
-                    if len(audio_bytes) == 0:
-                        continue
-                except:
-                    continue
-
-                if not connected_to_openai:
-                    await openai_connect()
-
-                # Resample input: 8kHz → 24kHz
-                samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-                target_num = int(len(samples) * (24000 / 8000))
-                if target_num == 0:
-                    continue
-                resampled = resample(samples, target_num)
-                resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
-                resampled_b64 = base64.b64encode(resampled.tobytes()).decode('utf-8')
-
-                await send_openai({
-                    "type": "input_audio_buffer.append",
-                    "audio": resampled_b64
-                })
-
-                # Barge-in: cancel only if response is active
-                if pending:
-                    await send_openai({"type": "response.cancel"})
-                    pending = False
-                    speaking = False
-                    logger.info("Barge-in: cancelled active response")
-
-            elif ev == "stop":
-                break
-
-    except WebSocketDisconnect:
-        logger.info("Exotel disconnected")
-    except Exception as e:
-        logger.exception("Error: %s", e)
-    finally:
-        await openai_close()        
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():

@@ -461,7 +461,7 @@ async def exotel_media_ws(ws: WebSocket):
                         b64 = evt.get("delta")
                         if b64:
                             pcm24 = base64.b64decode(b64)
-                            pcm8 = downsample_24k_to_8k_pcm16(pcm24)
+                            pcm8 = pcm24 #downsample_24k_to_8k_pcm16(pcm24)
                             await ws.send_text(json.dumps({
                                 "event": "media",
                                 "audio": base64.b64encode(pcm8).decode()

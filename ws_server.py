@@ -521,7 +521,7 @@ async def exotel_media_ws(ws: WebSocket):
                     await send_openai({
                         "type": "response.create",
                         "response": {
-                            "modalities": ["audio"],
+                            "modalities": ["text","audio"],
                             "instructions": (
                                 "Namaste! I am your LIC insurance advisor. "
                                 "May I know your age and if you have any family members?"

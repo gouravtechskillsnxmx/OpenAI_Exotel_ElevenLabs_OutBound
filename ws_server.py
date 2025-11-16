@@ -47,8 +47,6 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from aiohttp import ClientSession, WSMsgType
 from pydantic import BaseModel
-import numpy as np
-from scipy.signal import resample
 
 
 # ---------------- Logging ----------------
@@ -414,6 +412,7 @@ async def exotel_media_ws(ws: WebSocket):
 
     async def send_openai(payload: dict):
         if not openai_ws or openai_ws.closed:
+            logger.warning("Cannot send: OpenAI WS not ready")
             return
         t = payload.get("type")
         logger.info(f"→ OpenAI: {t}")
@@ -422,76 +421,80 @@ async def exotel_media_ws(ws: WebSocket):
     async def connect_and_speak():
         nonlocal openai_session, openai_ws, pump_task
 
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
-        url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
+        try:
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+            url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
-        openai_session = ClientSession()
-        openai_ws = await openai_session.ws_connect(url, headers=headers)
+            openai_session = ClientSession()
+            logger.info("Connecting to OpenAI...")
+            openai_ws = await openai_session.ws_connect(url, headers=headers)
+            logger.info("Connected to OpenAI WS")
 
-        # Disable VAD, force speech
-        await send_openai({
-            "type": "session.update",
-            "session": {
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "turn_detection": None,
-                "voice": "verse",
-                "instructions": "Say only: Hello, how are you?"
-            }
-        })
+            await send_openai({
+                "type": "session.update",
+                "session": {
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "turn_detection": None,
+                    "voice": "verse",
+                    "instructions": "Say only: Hello, how are you?"
+                }
+            })
 
-        # Trigger speech
-        await send_openai({
-            "type": "response.create",
-            "response": {
-                "modalities": ["text", "audio"],
-                "instructions": "Say exactly: Hello, how are you?"
-            }
-        })
+            await send_openai({
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "audio"],
+                    "instructions": "Say exactly: Hello, how are you?"
+                }
+            })
 
-        async def pump():
-            try:
-                async for msg in openai_ws:
-                    if msg.type != WSMsgType.TEXT:
-                        continue
-                    evt = msg.json()
-                    et = evt.get("type")
-                    logger.info(f"OpenAI EVENT: {et}")
+            async def pump():
+                try:
+                    async for msg in openai_ws:
+                        if msg.type != WSMsgType.TEXT:
+                            continue
+                        evt = msg.json()
+                        et = evt.get("type")
+                        logger.info(f"OpenAI EVENT: {et}")
 
-                    if et in ("response.audio.delta", "response.output_audio.delta"):
-                        b64 = evt.get("delta")
-                        if b64:
-                            pcm24 = base64.b64decode(b64)
-                            pcm8 = downsample_24k_to_8k_pcm16(pcm24)
-                            await ws.send_text(json.dumps({
-                                "event": "media",
-                                "audio": base64.b64encode(pcm8).decode()
-                            }))
+                        if et in ("response.audio.delta", "response.output_audio.delta"):
+                            b64 = evt.get("delta")
+                            if b64:
+                                pcm24 = base64.b64decode(b64)
+                                pcm8 = downsample_24k_to_8k_pcm16(pcm24)
+                                await ws.send_text(json.dumps({
+                                    "event": "media",
+                                    "audio": base64.b64encode(pcm8).decode()
+                                }))
+                                logger.info("Sent audio delta to Exotel")
 
-                    elif et == "response.audio.done":
-                        logger.info("Bot said: Hello, how are you?")
-                        await asyncio.sleep(1)
-                        await ws.close()  # End call
+                        elif et == "response.audio.done":
+                            logger.info("Bot said: Hello, how are you?")
+                            await asyncio.sleep(2)  # Short delay to ensure audio plays
+                            await ws.close()  # End call
 
-            except Exception as e:
-                logger.exception("Pump error: %s", e)
+                except Exception as e:
+                    logger.exception("Pump error: %s", e)
 
-        pump_task = asyncio.create_task(pump())
+            pump_task = asyncio.create_task(pump())
+
+        except Exception as e:
+            logger.exception("OpenAI connection error: %s", e)
 
     try:
-        # Wait for Exotel "start" event
         raw = await ws.receive_text()
         m = json.loads(raw)
         if m.get("event") == "start":
             logger.info("Exotel stream started — speaking now")
             await connect_and_speak()
 
-        # Ignore all other messages
+        # Keep alive until "stop" or close
         while True:
-            await ws.receive_text()  # Keep connection alive
+            await ws.receive_text()
 
     except WebSocketDisconnect:
-        logger.info("Call ended")
+        logger.info("Call disconnected")
     except Exception as e:
         logger.exception("Error: %s", e)
     finally:
@@ -501,6 +504,7 @@ async def exotel_media_ws(ws: WebSocket):
             await openai_ws.close()
         if openai_session:
             await openai_session.close()
+
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():

@@ -179,7 +179,7 @@ OPENAI_API_KEY = (
     or os.getenv("OpenAI_Key")
     or os.getenv("OPENAI_KEY", "")
 )
-REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 
 # ---------------- Misc ENV ----------------
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol

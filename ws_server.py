@@ -47,6 +47,8 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from aiohttp import ClientSession, WSMsgType
 from pydantic import BaseModel
+import numpy as np
+from scipy.signal import resample
 
 
 # ---------------- Logging ----------------
@@ -437,7 +439,7 @@ async def exotel_media_ws(ws: WebSocket):
                     "output_audio_format": "pcm16",
                     "turn_detection": None,
                     "voice": "verse",
-                    "instructions": "Say only: Hello, how are you?"
+                    "instructions": "You are a test bot."
                 }
             })
 
@@ -456,7 +458,7 @@ async def exotel_media_ws(ws: WebSocket):
                             continue
                         evt = msg.json()
                         et = evt.get("type")
-                        logger.info(f"OpenAI EVENT: {et}")
+                        logger.info(f"OpenAI EVENT: {et} - Full evt: {evt}")
 
                         if et in ("response.audio.delta", "response.output_audio.delta"):
                             b64 = evt.get("delta")
@@ -471,7 +473,7 @@ async def exotel_media_ws(ws: WebSocket):
 
                         elif et == "response.audio.done":
                             logger.info("Bot said: Hello, how are you?")
-                            await asyncio.sleep(2)  # Short delay to ensure audio plays
+                            await asyncio.sleep(5)  # Wait for audio to play
                             await ws.close()  # End call
 
                 except Exception as e:
@@ -483,13 +485,16 @@ async def exotel_media_ws(ws: WebSocket):
             logger.exception("OpenAI connection error: %s", e)
 
     try:
+        # Wait for "start" from Exotel
         raw = await ws.receive_text()
         m = json.loads(raw)
         if m.get("event") == "start":
             logger.info("Exotel stream started — speaking now")
             await connect_and_speak()
+        else:
+            logger.warning("Unexpected first event: {ev}".format(ev=m.get("event")))
 
-        # Keep alive until "stop" or close
+        # Keep alive loop
         while True:
             await ws.receive_text()
 
@@ -504,7 +509,6 @@ async def exotel_media_ws(ws: WebSocket):
             await openai_ws.close()
         if openai_session:
             await openai_session.close()
-
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():

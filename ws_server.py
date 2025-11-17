@@ -192,6 +192,12 @@ def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
     converted, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
     return converted
 
+def upsample_8k_to_24k_pcm16(pcm8: bytes) -> bytes:
+    """8 kHz mono PCM16 -> 24 kHz mono PCM16 using stdlib audioop."""
+    converted, _ = audioop.ratecv(pcm8, 2, 1, 8000, 24000, None)
+    return converted
+
+
 
 # ---------------- Helper: Exotel outbound (Connect API) ----------------
 async def exotel_connect_voicebot(to_e164: str) -> dict:

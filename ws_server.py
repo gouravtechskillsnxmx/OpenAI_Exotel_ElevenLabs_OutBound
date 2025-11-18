@@ -426,8 +426,9 @@ async def exotel_media_ws(ws: WebSocket):
 
     # Buffer for caller audio -> OpenAI
     caller_buf = bytearray()
-    CALLER_MIN_BUF_BYTES = 1600  # ~0.2s at 8kHz * 2 bytes
-    awaiting_response = False    # prevent overlapping responses
+    CALLER_MIN_BUF_BYTES = 1600  # ~0.1s at 8kHz * 2 bytes (kept as in working version)
+    awaiting_response = False    # True while waiting for bot's reply (also used for barge-in)
+    speaking = False             # True while bot is actively streaming audio
 
     async def send_openai(payload: dict):
         if not openai_ws or openai_ws.closed:
@@ -502,6 +503,7 @@ async def exotel_media_ws(ws: WebSocket):
             "type": "response.create",
             "response": {
                 "modalities": ["audio", "text"],
+                # persona is in session.instructions
             },
         })
 
@@ -523,32 +525,45 @@ async def exotel_media_ws(ws: WebSocket):
             openai_ws = await openai_session.ws_connect(url, headers=headers)
             logger.info("Connected to OpenAI WS")
 
-            # LIC agent persona (Hinglish, concise)
+            # LIC agent persona (Hinglish, concise, Shashinath)
             await send_openai({
                 "type": "session.update",
                 "session": {
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
-                    "turn_detection": None,
+                    "turn_detection": None,  # we control turns via flush_caller_audio
                     "voice": "alloy",
                     "instructions": (
                         "You are Mr. Shashinath Thakur, a senior LIC insurance agent from India. "
-                        "You speak in friendly Hinglish in realtime (mix of Hindi and English), calm and trustworthy, "
-                        "like a real experienced LIC advisor. "
+                        "You speak in friendly Hinglish (mix of Hindi and English), calm and trustworthy, "
+                        "like a real experienced LIC advisor talking on the phone. "
                         "Help the caller with LIC life insurance, term plans, premiums, maturity values, "
                         "tax benefits, riders, and claim process. "
-                        "At the very start of the call, before the caller says anything, you must greet them "
-                        "and clearly introduce yourself as 'LIC agent Mr. Shashinath Thakur', then ask how "
-                        "you can help with LIC today. "
-                        "During the rest of the call, keep answers short (1–2 sentences) and then ask one "
-                        "clear follow-up question. Never talk about topics outside LIC insurance and basic "
-                        "financial planning."
+                        "Always keep each reply very short: 1–2 sentences, then stop and wait for the caller. "
+                        "If the caller starts speaking while you are talking, stop speaking and listen. "
+                        "Never talk about topics outside LIC insurance and basic financial planning."
+                    ),
+                },
+            })
+
+            # 🔹 Initial greeting so the caller always hears Shashinath once
+            awaiting_response = True
+            await send_openai({
+                "type": "response.create",
+                "response": {
+                    "modalities": ["audio", "text"],
+                    "instructions": (
+                        "The phone call has just started. Politely greet the caller and clearly introduce "
+                        "yourself as \"LIC agent Mr. Shashinath Thakur from Mumbai\" in Hinglish. "
+                        "Example: 'Namaste, main LIC agent Mr. Shashinath Thakur bol raha hoon, "
+                        "Mumbai se. Main aapko LIC policy ya term plan mein kaise help kar sakta hoon?' "
+                        "Speak only 1–2 short sentences, then stop and wait for the caller."
                     ),
                 },
             })
 
             async def pump():
-                nonlocal awaiting_response
+                nonlocal awaiting_response, speaking
                 try:
                     async for msg in openai_ws:
                         if msg.type != WSMsgType.TEXT:
@@ -568,11 +583,16 @@ async def exotel_media_ws(ws: WebSocket):
                             # 24k PCM16 from OpenAI -> 8k PCM16 for Exotel
                             pcm24 = base64.b64decode(b64)
                             pcm8 = downsample_24k_to_8k_pcm16(pcm24)
+                            speaking = True
                             await send_audio_to_exotel(pcm8)
 
                         elif et in ("response.audio.done", "response.output_audio.done", "response.done"):
                             logger.info("OpenAI response finished.")
+                            speaking = False
                             awaiting_response = False
+
+                        elif et == "error":
+                            logger.error("OpenAI ERROR: %s", evt)
 
                 except Exception as e:
                     logger.exception("Pump error: %s", e)
@@ -609,6 +629,16 @@ async def exotel_media_ws(ws: WebSocket):
                 payload_b64 = media.get("payload")
                 if payload_b64:
                     pcm8 = base64.b64decode(payload_b64)
+
+                    # 🔹 BARGE-IN: if user speaks while bot is talking, cancel current response
+                    if awaiting_response:
+                        logger.info("Barge-in: caller spoke while bot speaking, cancelling current response")
+                        try:
+                            await send_openai({"type": "response.cancel"})
+                        except Exception as e:
+                            logger.exception("Error sending response.cancel: %s", e)
+                        awaiting_response = False
+
                     caller_buf.extend(pcm8)
 
                     # When buffer is big enough and we're not already waiting on a reply,
@@ -634,7 +664,6 @@ async def exotel_media_ws(ws: WebSocket):
             await openai_ws.close()
         if openai_session:
             await openai_session.close()
-
 
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)

@@ -403,63 +403,77 @@ async def exotel_ws_bootstrap():
         return {"url": f"wss://{(PUBLIC_BASE_URL or 'openai-exotel-elevenlabs-outbound.onrender.com')}/exotel-media"}
 
 # ---------------- Realtime media bridge (Exotel <-> OpenAI LIC Agent) ----------------
+
 @app.websocket("/exotel-media")
 async def exotel_media_ws(ws: WebSocket):
     await ws.accept()
-    logger.info("LIC Agent mode: Exotel WS connected")
+    logger.info("Exotel WS connected (Shashinath LIC agent, realtime)")
 
     if not OPENAI_API_KEY:
-        logger.error("No OPENAI_API_KEY")
+        logger.error("No OPENAI_API_KEY; closing Exotel stream.")
         await ws.close()
         return
 
+    # --------- Stream state ---------
+    stream_sid: Optional[str] = None
+
+    # Incoming audio from Exotel
+    sample_rate: int = 8000       # Exotel media sample rate (updated from "start")
+    target_sr: int = 24000        # OpenAI realtime expects 24k PCM16
+    bytes_per_sample: int = 2     # PCM16 mono
+
+    # We will only commit when we know we have enough audio
+    min_commit_ms: float = 120.0  # >=100ms required by Realtime; we use 120ms for safety
+    silence_duration_ms: float = 600.0  # end-of-turn if no audio for 600ms
+
+    buffered_ms: float = 0.0      # how much caller audio we’ve sent since last commit
+    last_audio_time: float = 0.0  # last time we got caller audio
+    silence_check_task: Optional[asyncio.Task] = None
+
+    # Outgoing audio to Exotel
+    seq_num = 1       # Exotel sequence_number
+    chunk_num = 1     # Exotel media.chunk
+    start_ts = time.time()
+
+    # Realtime/OpenAI
     openai_session: Optional[ClientSession] = None
     openai_ws = None
-    pump_task: Optional[asyncio.Task] = None
-
-    # Exotel stream info
-    stream_sid: Optional[str] = None
-    out_seq = 1        # Exotel "sequence_number"
-    out_chunk = 1      # Exotel "media.chunk"
-    out_ts_ms = 0      # Exotel "media.timestamp" (ms)
-
-    # Buffer for caller audio -> OpenAI
-    caller_buf = bytearray()
-    CALLER_MIN_BUF_BYTES = 1600  # keep as in working version (~0.1s at 8kHz * 2 bytes)
-    awaiting_response = False    # prevent overlapping responses
-
-    async def send_openai(payload: dict):
-        if not openai_ws or openai_ws.closed:
-            logger.warning("Cannot send: OpenAI WS not ready")
-            return
-        t = payload.get("type")
-        logger.info(f"→ OpenAI: {t}")
-        await openai_ws.send_json(payload)
+    openai_reader_task: Optional[asyncio.Task] = None
+    speaking: bool = False        # True while bot is sending audio
+										 
+											 
+																 
+				  
+							   
+										
+										  
 
     async def send_audio_to_exotel(pcm8: bytes):
-        """Send 8k PCM16 audio to Exotel as proper media frames."""
-        nonlocal out_seq, out_chunk, out_ts_ms, stream_sid
+        """Send 8k PCM16 audio back to Exotel as proper media frames."""
+        nonlocal seq_num, chunk_num, start_ts, stream_sid
 
         if not stream_sid:
-            logger.warning("No stream_sid yet; cannot send audio to Exotel")
+            logger.warning("No stream_sid; cannot send audio to Exotel yet")
             return
 
-        # 20ms frames: 8000 Hz * 2 bytes * 0.02s = 320 bytes
-        FRAME_BYTES = 320
+        FRAME_BYTES = 320  # 20 ms at 8kHz mono 16-bit
+        now_ms = lambda: int((time.time() - start_ts) * 1000)
+
         for i in range(0, len(pcm8), FRAME_BYTES):
             chunk_bytes = pcm8[i:i + FRAME_BYTES]
             if not chunk_bytes:
                 continue
 
             payload_b64 = base64.b64encode(chunk_bytes).decode("ascii")
+            ts = now_ms()
 
             msg = {
                 "event": "media",
                 "stream_sid": stream_sid,
-                "sequence_number": str(out_seq),
+                "sequence_number": str(seq_num),
                 "media": {
-                    "chunk": str(out_chunk),
-                    "timestamp": str(out_ts_ms),
+                    "chunk": str(chunk_num),
+                    "timestamp": str(ts),
                     "payload": payload_b64,
                 },
             }
@@ -467,189 +481,272 @@ async def exotel_media_ws(ws: WebSocket):
             await ws.send_text(json.dumps(msg))
             logger.info(
                 "Sent audio media to Exotel (seq=%s, chunk=%s, bytes=%s)",
-                out_seq,
-                out_chunk,
-                len(chunk_bytes),
+                seq_num, chunk_num, len(chunk_bytes),
             )
 
-            out_seq += 1
-            out_chunk += 1
-            out_ts_ms += 20  # 20 ms per frame
+            seq_num += 1
+            chunk_num += 1
+    async def openai_connect():
+        """Open the Realtime WS to OpenAI and configure the Shashinath LIC persona."""
+        nonlocal openai_session, openai_ws, openai_reader_task
 
-    async def flush_caller_audio():
-        """Flush buffered caller audio to OpenAI as one turn."""
-        nonlocal caller_buf, awaiting_response
-        if not caller_buf or awaiting_response or not openai_ws:
-            return
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1",
+        }
+        url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
-        pcm8 = bytes(caller_buf)
-        caller_buf.clear()
+        openai_session = ClientSession()
+        openai_ws = await openai_session.ws_connect(url, headers=headers)
+        logger.info("Connected to OpenAI Realtime WS")
 
-        # Up-sample Exotel 8k PCM16 -> 24k PCM16 for OpenAI
-        pcm24 = upsample_8k_to_24k_pcm16(pcm8)
-        b64 = base64.b64encode(pcm24).decode("ascii")
-
-        # Send as input_audio_buffer turn
-        await send_openai({
-            "type": "input_audio_buffer.append",
-            "audio": b64,
-        })
-        await send_openai({
-            "type": "input_audio_buffer.commit"
-        })
-        await send_openai({
-            "type": "response.create",
-            "response": {
-                "modalities": ["audio", "text"],
-                # keep generic here, persona is in session.instructions
+        # Session config: PCM16 in/out, manual commit based on silence, LIC persona
+        await openai_ws.send_json({
+            "type": "session.update",
+            "session": {
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": None,   # WE manage turns with silence + commit
+                "voice": "alloy",
+                "instructions": (
+                    "You are Mr. Shashinath Thakur, a senior LIC life insurance advisor "
+                    "based in Mumbai. You speak in friendly Hinglish (mix of Hindi and English), "
+                    "calm and trustworthy, like a real LIC agent on a phone call. "
+                    "Help callers with LIC life insurance, term plans, premiums, riders, "
+                    "maturity values, tax benefits, and claim process. "
+                    "In your FIRST reply, clearly introduce yourself as 'LIC agent "
+                    "Mr. Shashinath Thakur from Mumbai'. "
+                    "For every reply, speak very briefly: about 1–2 sentences, 8–12 words, "
+                    "then stop and wait silently for the caller. "
+                    "Never talk about topics outside LIC insurance and basic financial planning."
+                ),
             },
         })
 
-        awaiting_response = True
-        logger.info("Flushed caller audio to OpenAI as a new turn (%s bytes)", len(pcm24))
+        # 🔹 Immediate intro so the caller always hears Shashinath
+        await openai_ws.send_json({
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio", "text"],
+                "instructions": (
+                    "The phone call has just started. Politely greet the caller and clearly "
+                    "introduce yourself as \"LIC agent Mr. Shashinath Thakur from Mumbai\" in Hinglish. "
+                    "Example: 'Namaste, main LIC agent Mr. Shashinath Thakur bol raha hoon, "
+                    "Mumbai se. Main aapko LIC policy ya term plan mein kaise help kar sakta hoon?' "
+                    "Speak only 1–2 very short sentences, then stop and wait silently for the caller."
+                ),
+            },
+        })
 
-    async def connect_openai():
-        nonlocal openai_session, openai_ws, pump_task, awaiting_response
+        async def pump_openai_to_exotel():
+            nonlocal speaking
+            tts_dump: bytearray = bytearray()
 
-        try:
-            headers = {
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1",
-            }
-            url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
-
-            openai_session = ClientSession()
-            logger.info("Connecting to OpenAI Realtime WS...")
-            openai_ws = await openai_session.ws_connect(url, headers=headers)
-            logger.info("Connected to OpenAI WS")
-
-            # LIC agent persona (Hinglish, concise, Shashinath)
-            await send_openai({
-                "type": "session.update",
-                "session": {
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "turn_detection": None,  # we control turns via flush_caller_audio
-                    "voice": "alloy",
-                    "instructions": (
-                        "You are Mr. Shashinath Thakur, a senior LIC insurance agent from India. "
-                        "You speak in friendly Hinglish (mix of Hindi and English), calm and trustworthy, "
-                        "like a real experienced LIC advisor talking on the phone. "
-                        "Help the caller with LIC life insurance, term plans, premiums, maturity values, "
-                        "tax benefits, riders, and claim process. "
-                        "Always keep each reply very short: 1–2 sentences, then stop and wait for the caller. "
-                        "Never talk about topics outside LIC insurance and basic financial planning."
-                    ),
-                },
-            })
-
-            # 🔹 Intro: Shashinath speaks as soon as the call starts
-            awaiting_response = True
-            await send_openai({
-                "type": "response.create",
-                "response": {
-                    "modalities": ["audio", "text"],
-                    "instructions": (
-                        "The phone call has just started. "
-                        "Politely greet the caller and clearly introduce yourself as "
-                        "\"LIC agent Mr. Shashinath Thakur from Mumbai\" in Hinglish. "
-                        "Example: 'Namaste, main LIC agent Mr. Shashinath Thakur bol raha hoon, "
-                        "Mumbai se. Main aapko LIC policy ya term plan mein kaise help kar sakta hoon?' "
-                        "Speak only 1–2 short sentences and then stop and wait for the caller to speak."
-                    ),
-                },
-            })
-
-            async def pump():
-                nonlocal awaiting_response
-                try:
-                    async for msg in openai_ws:
-                        if msg.type != WSMsgType.TEXT:
-                            continue
+            try:
+                async for msg in openai_ws:
+                    if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
-                        et = evt.get("type")
-                        logger.info(f"OpenAI EVENT: {et} - evt={evt}")
+                        etype = evt.get("type")
+                        logger.info("OpenAI EVENT: %s", etype)
 
-                        if et in ("response.audio.delta", "response.output_audio.delta"):
-                            # Handle both shapes: evt["delta"] or evt["audio"]["data"]
-                            b64 = evt.get("delta")
-                            if not b64 and "audio" in evt and "data" in evt["audio"]:
-                                b64 = evt["audio"]["data"]
-                            if not b64:
-                                continue
+                        if etype == "response.audio.delta":
+                            chunk_b64 = evt.get("delta")
+                            if chunk_b64 and ws.client_state.name != "DISCONNECTED":
+                                pcm24 = base64.b64decode(chunk_b64)
+                                if SAVE_TTS_WAV:
+                                    tts_dump.extend(pcm24)
 
-                            # 24k PCM16 from OpenAI -> 8k PCM16 for Exotel
-                            pcm24 = base64.b64decode(b64)
-                            pcm8 = downsample_24k_to_8k_pcm16(pcm24)
-                            await send_audio_to_exotel(pcm8)
+                                pcm8 = downsample_24k_to_8k_pcm16(pcm24)
+                                speaking = True
+                                await send_audio_to_exotel(pcm8)
 
-                        elif et in ("response.audio.done", "response.output_audio.done", "response.done"):
-                            logger.info("OpenAI response finished.")
-                            awaiting_response = False
+                        elif etype in ("response.audio.done", "response.completed", "response.done"):
+                            logger.info("OpenAI finished a response turn")
+                            speaking = False
 
-                        elif et == "error":
-                            logger.error("OpenAI ERROR: %s", evt)
+                        elif etype == "error":
+                            logger.error("OpenAI error event: %s", evt)
+                            break
 
-                except Exception as e:
-                    logger.exception("Pump error: %s", e)
+                    elif msg.type == WSMsgType.ERROR:
+                        logger.error("OpenAI WS error")
+                        break
+            except Exception as e:
+                logger.exception("OpenAI pump error: %s", e)
+            finally:
+                if SAVE_TTS_WAV and tts_dump:
+                    fname = f"/tmp/openai_tts_{int(time.time())}.wav"
+                    with wave.open(fname, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(24000)
+                        wf.writeframes(bytes(tts_dump))
+                    logger.info("Saved OpenAI TTS to %s", fname)
 
-            pump_task = asyncio.create_task(pump())
+        openai_reader_task = asyncio.create_task(pump_openai_to_exotel())
 
-        except Exception as e:
-            logger.exception("OpenAI connection error: %s", e)
+    async def openai_close():
+        """Gracefully close OpenAI WS and session."""
+        nonlocal silence_check_task
+        if silence_check_task:
+            silence_check_task.cancel()
+        try:
+            if openai_reader_task and not openai_reader_task.done():
+                openai_reader_task.cancel()
+        except Exception:
+            pass
+        try:
+            if openai_ws and not openai_ws.closed:
+                await openai_ws.close()
+        except Exception:
+            pass
+        try:
+            if openai_session:
+                await openai_session.close()
+        except Exception:
+            pass
+
+    # Silence checker: detect end-of-turn and trigger commit + response.create
+    async def silence_checker():
+        nonlocal buffered_ms, last_audio_time
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(0.1)
+            if last_audio_time == 0.0:
+                continue
+            now = loop.time()
+            if (now - last_audio_time) * 1000.0 > silence_duration_ms:
+                if buffered_ms >= min_commit_ms:
+                    logger.info(
+                        "Silence %.0fms and buffered_ms=%.1fms -> commit & respond",
+                        (now - last_audio_time) * 1000.0,
+                        buffered_ms,
+                    )
+                    # Tell Realtime to treat what we've sent as one user turn
+                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                    await openai_ws.send_json({
+                        "type": "response.create",
+                        "response": {
+                            "modalities": ["audio", "text"],
+                            "instructions": (
+                                "Reply as LIC agent Mr. Shashinath Thakur in friendly Hinglish. "
+                                "Give a very short answer (1–2 sentences), then stop."
+                            ),
+                        },
+                    })
+                    buffered_ms = 0.0
+                    last_audio_time = loop.time()
+
+    # Connect to OpenAI and start silence checker
+    await openai_connect()
+    silence_check_task = asyncio.create_task(silence_checker())
+
+    loop = asyncio.get_event_loop()
 
     try:
-        bot_started = False
-
         while True:
             raw = await ws.receive_text()
-            m = json.loads(raw)
-            ev = m.get("event")
-            logger.info("Exotel EVENT: %s - msg=%s", ev, m)
+            evt = json.loads(raw)
+            etype = evt.get("event")
+            logger.info("Exotel EVENT: %s - msg=%s", etype, evt)
 
-            if ev == "connected":
-                # handshake only
+            if etype == "connected":
+								
                 continue
 
-            elif ev == "start":
-                # capture stream_sid and connect to OpenAI
-                stream_sid = m.get("stream_sid") or (m.get("start") or {}).get("stream_sid")
-                logger.info("Exotel stream started, stream_sid=%s", stream_sid)
-                if not bot_started:
-                    bot_started = True
-                    await connect_openai()
+            elif etype == "start":
+                start_obj = evt.get("start", {})
+                stream_sid = start_obj.get("stream_sid") or start_obj.get("streamSid")
+                mf = start_obj.get("media_format") or {}
+                sample_rate = int(mf.get("sample_rate") or sample_rate)
+                logger.info("Exotel stream started sid=%s sr=%d", stream_sid, sample_rate)
+                start_ts = time.time()
+                last_audio_time = loop.time()
+												
 
-            elif ev == "media":
-                # Caller audio from Exotel -> buffer -> OpenAI turn
-                media = m.get("media") or {}
+            elif etype == "media":
+																								  
+                media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
-                if payload_b64:
-                    pcm8 = base64.b64decode(payload_b64)
-                    caller_buf.extend(pcm8)
+																	  
+                if not payload_b64:
+                    continue
+																	   
 
-                    # When buffer is big enough and we're not already waiting on a reply,
-                    # flush as a turn to OpenAI.
-                    if len(caller_buf) >= CALLER_MIN_BUF_BYTES and not awaiting_response:
-                        await flush_caller_audio()
+                if openai_ws is None or openai_ws.closed:
+                    logger.warning("OpenAI WS not ready; skipping audio frame")
+                    continue
+					  
+																							 
+																			 
 
-            elif ev == "stop":
-                logger.info("Exotel sent stop; closing WS.")
+                # Decode input audio from Exotel
+                try:
+                    audio_bytes = base64.b64decode(payload_b64)
+                    if len(audio_bytes) == 0:
+                        continue
+                except Exception:
+                    logger.warning("Invalid base64 in media payload")
+                    continue
+
+                # Approximate ms in this frame and accumulate
+                samples = len(audio_bytes) / bytes_per_sample
+                frame_ms = (samples / sample_rate) * 1000.0
+                buffered_ms += frame_ms
+
+                # HARD BARGE-IN: if bot is speaking and user talks, cancel current response
+                if speaking:
+                    logger.info("Barge-in: caller spoke while bot speaking, cancelling response")
+                    try:
+                        await openai_ws.send_json({"type": "response.cancel"})
+                    except Exception as e:
+                        logger.exception("Error sending response.cancel: %s", e)
+                    speaking = False
+
+                # Resample caller audio from sample_rate -> 24kHz
+                if sample_rate != target_sr:
+                    try:
+                        samples_arr = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                        resample_ratio = target_sr / sample_rate
+                        target_samples = int(len(samples_arr) * resample_ratio)
+                        if target_samples <= 0:
+                            continue
+                        resampled = resample(samples_arr, target_samples)
+                        resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+                        resampled_bytes = resampled.tobytes()
+                        resampled_b64 = base64.b64encode(resampled_bytes).decode("utf-8")
+                    except Exception as e:
+                        logger.error("Resample failed: %s", e)
+                        continue
+                else:
+                    resampled_b64 = payload_b64
+
+                # Append to OpenAI buffer (we'll commit on silence)
+                await openai_ws.send_json({
+                    "type": "input_audio_buffer.append",
+                    "audio": resampled_b64
+                })
+                last_audio_time = loop.time()
+
+            elif etype == "dtmf":
+                # ignore for now
+                pass
+
+            elif etype == "stop":
+                logger.info("Exotel stream stopped sid=%s", stream_sid)
                 break
-
-            else:
-                logger.warning("Unhandled Exotel event: %s", ev)
 
     except WebSocketDisconnect:
         logger.info("Exotel WS disconnected")
     except Exception as e:
-        logger.exception("Error in exotel_media_ws: %s", e)
+        logger.exception("Exotel WS error: %s", e)
     finally:
-        if pump_task:
-            pump_task.cancel()
-        if openai_ws and not openai_ws.closed:
-            await openai_ws.close()
-        if openai_session:
-            await openai_session.close()
+        await openai_close()
+        try:
+											  
+            await ws.close()
+        except Exception:
+            pass
 
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)

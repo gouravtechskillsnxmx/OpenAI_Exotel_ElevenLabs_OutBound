@@ -184,6 +184,7 @@ REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 # ---------------- Misc ENV ----------------
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol
 SAVE_TTS_WAV    = os.getenv("SAVE_TTS_WAV", "0") == "1"
+OPENAI_MAX_TALK_SECONDS = int(os.getenv("OPENAI_MAX_TALK_SECONDS", "180"))
 
 
 # ---------------- Helper: downsample ----------------
@@ -423,18 +424,32 @@ async def exotel_media_ws(ws: WebSocket):
     openai_session: Optional[ClientSession] = None
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
+    openai_timeout_task: Optional[asyncio.Task] = None
+    openai_timed_out = False
 
-						
-									
-												 
-											 
-													  
+    async def close_openai_realtime(reason: str = "unknown"):
+        nonlocal openai_session, openai_ws, pump_task, openai_timeout_task, openai_timed_out
 
-									   
-							
-																					   
-																							  
-																			 
+        logger.info("Closing OpenAI realtime connection: %s", reason)
+
+        if pump_task:
+            pump_task.cancel()
+            pump_task = None
+
+        try:
+            if openai_ws and not openai_ws.closed:
+                await openai_ws.close()
+        except Exception:
+            logger.exception("Error while closing OpenAI WS")
+
+        try:
+            if openai_session:
+                await openai_session.close()
+        except Exception:
+            logger.exception("Error while closing OpenAI session")
+
+        openai_ws = None
+        openai_session = None
 
     async def send_openai(payload: dict):
         if not openai_ws or openai_ws.closed:
@@ -484,40 +499,6 @@ async def exotel_media_ws(ws: WebSocket):
 
             seq_num += 1
             chunk_num += 1
-											  
-
-								   
-																
-											  
-																
-				  
-
-								
-						  
-
-														   
-											  
-													 
-
-										 
-						   
-												
-						 
-		  
-						   
-											   
-		  
-						   
-									  
-						 
-												
-													
-			  
-		  
-
-								
-																						  
-
     async def connect_openai():
         """Connect to OpenAI Realtime and configure Shashinath LIC persona + intro."""
         nonlocal openai_session, openai_ws, pump_task
@@ -591,8 +572,7 @@ async def exotel_media_ws(ws: WebSocket):
                                 b64 = evt["audio"]["data"]
                             if not b64:
                                 continue
-
-																		  
+															  
                             pcm24 = base64.b64decode(b64)
                             pcm8 = downsample_24k_to_8k_pcm16(pcm24)
 										   
@@ -600,8 +580,6 @@ async def exotel_media_ws(ws: WebSocket):
 
                         elif et in ("response.audio.done", "response.output_audio.done", "response.done"):
                             logger.info("OpenAI finished a response turn.")
-											
-													 
 
                         elif et == "error":
                             logger.error("OpenAI ERROR: %s", evt)
@@ -610,6 +588,25 @@ async def exotel_media_ws(ws: WebSocket):
                     logger.exception("OpenAI pump error: %s", e)
 
             pump_task = asyncio.create_task(pump())
+
+            async def enforce_openai_timeout():
+                nonlocal openai_timed_out
+                try:
+                    await asyncio.sleep(max(1, OPENAI_MAX_TALK_SECONDS))
+                    openai_timed_out = True
+                    logger.info(
+                        "OpenAI realtime timeout reached after %s seconds; closing OpenAI side.",
+                        OPENAI_MAX_TALK_SECONDS,
+                    )
+                    await close_openai_realtime(
+                        f"OPENAI_MAX_TALK_SECONDS={OPENAI_MAX_TALK_SECONDS}"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception("OpenAI timeout task error: %s", e)
+
+            openai_timeout_task = asyncio.create_task(enforce_openai_timeout())
 
         except Exception as e:
             logger.exception("OpenAI connection error: %s", e)
@@ -651,24 +648,14 @@ async def exotel_media_ws(ws: WebSocket):
 
                     pcm24 = upsample_8k_to_24k_pcm16(pcm8)
                     audio_b64 = base64.b64encode(pcm24).decode("ascii")
-																											 
-							
-																		  
-											  
-																					
-												 
-
                     await send_openai({
                         "type": "input_audio_buffer.append",
                         "audio": audio_b64,
                     })
                     # NOTE: With server_vad we DO NOT call input_audio_buffer.commit manually.
                     # The server will commit automatically when it detects end-of-speech.
-
-																						 
-												
-																						 
-												  
+                elif openai_timed_out:
+                    logger.info("Ignoring caller audio because OpenAI side was closed after timeout.")
 
             elif ev == "stop":
                 logger.info("Exotel sent stop; closing WS.")
@@ -682,18 +669,9 @@ async def exotel_media_ws(ws: WebSocket):
     except Exception as e:
         logger.exception("Error in exotel_media_ws: %s", e)
     finally:
-        if pump_task:
-            pump_task.cancel()
-        try:
-            if openai_ws and not openai_ws.closed:
-                await openai_ws.close()
-        except Exception:
-            pass
-        try:
-            if openai_session:
-                await openai_session.close()
-        except Exception:
-            pass
+        if openai_timeout_task:
+            openai_timeout_task.cancel()
+        await close_openai_realtime("exotel websocket cleanup")
         try:
             await ws.close()
         except Exception:
